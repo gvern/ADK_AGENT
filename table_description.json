@@ -1,0 +1,436 @@
+{
+	"tables": [
+		{
+			"name": "complement_individu",
+			"description": "Table des informations complémentaires sur les clients contenant les préférences et caractéristiques morphologiques. Utilisée pour la personnalisation des offres et recommandations produits.",
+			"fields": [
+				{
+					"name": "ID_INDIVIDU",
+					"type": "INTEGER",
+					"mode": "NULLABLE",
+					"key": "FOREIGN_KEY -> individu.ID_INDIVIDU",
+					"description": "Identifiant unique du client. Clé étrangère faisant le lien avec la table INDIVIDU. Permet de relier les informations complémentaires au client principal."
+				},
+				{
+					"name": "CODE_MAGASIN",
+					"type": "INTEGER",
+					"mode": "NULLABLE",
+					"key": "-",
+					"description": "Magasin gestionnaire principal du client. Identifie le point de vente de référence du client pour la gestion de la relation client et le suivi commercial."
+				},
+				{
+					"name": "TAILLE_BAS",
+					"type": "INTEGER",
+					"mode": "NULLABLE",
+					"key": "-",
+					"description": "Tour de taille du client pour les vêtements du bas. Information utilisée pour les recommandations produits et la personnalisation des offres vestimentaires."
+				},
+				{
+					"name": "TAILLE_HAUT",
+					"type": "INTEGER",
+					"mode": "NULLABLE",
+					"key": "-",
+					"description": "Taille utilisée par le client pour les vêtements du haut. Information utilisée pour les recommandations produits et la personnalisation des offres vestimentaires."
+				},
+				{
+					"name": "BONNET",
+					"type": "STRING",
+					"mode": "NULLABLE",
+					"key": "-",
+					"description": "Taille bonnet poitrine pour la lingerie. Information utilisée pour les recommandations produits dans la catégorie lingerie et la personnalisation des offres."
+				},
+				{
+					"name": "SEGACT",
+					"type": "STRING",
+					"mode": "NULLABLE",
+					"key": "-",
+					"allowed_values": [
+						"IA",
+						"FI",
+						"DP",
+						"IC",
+						"RC"
+					],
+					"description": "Segment d'activité principal du client définissant son profil d'achat. Valeurs possibles : IA (Inactif - client n'ayant pas effectué d'achat récent), FI (Fidèle - client régulier avec achats fréquents), DP (Départ - client en phase de désengagement), IC (Incertain - comportement d'achat irrégulier), RC (Récent - nouveau client ou retour d'activité). Utilisé pour le ciblage marketing et les stratégies de fidélisation personnalisées."
+				},
+				{
+					"name": "SOUSSEG",
+					"type": "STRING",
+					"mode": "NULLABLE",
+					"key": "-",
+					"allowed_values": [
+						"IA",
+						"AB",
+						"CU",
+						"IS",
+						"EC",
+						"SP",
+						"NV",
+						"VS"
+					],
+					"description": "Sous-segment détaillé précisant le profil comportemental du client. Valeurs possibles : IA (Inactif Ancien - plus d'activité depuis longue période), AB (Abandonné - perte de contact), CU (Client Unique - un seul achat historique), IS (Irrégulier Saisonnier - achats ponctuels saisonniers), EC (En Croissance - augmentation progressive des achats), SP (Super Premium - client haute valeur), NV (Nouveau - client récemment acquis), VS (VIP Stable - client fidèle à haute valeur). Utilisé pour l'analyse fine du comportement client et la personnalisation des actions commerciales."
+				}
+			]
+		},
+		{
+			"name": "individu",
+			"description": "Table maître des clients.",
+			"fields": [
+				{
+					"name": "ID_INDIVIDU",
+					"type": "INTEGER",
+					"mode": "NULLABLE",
+					"key": "PRIMARY_KEY",
+					"description": "Identifiant unique du client. Clé primaire de la table permettant d'identifier de manière unique chaque client dans l'ensemble du système. Utilisé comme référence dans toutes les tables liées aux clients."
+				},
+				{
+					"name": "ID_FOYER",
+					"type": "INTEGER",
+					"mode": "NULLABLE",
+					"key": "FOREIGN_KEY (optionnelle)",
+					"description": "Identifiant du foyer auquel appartient l'individu. Permet de regrouper les clients d'un même foyer pour des analyses familiales et des offres groupées. Clé étrangère vers la table des foyers."
+				},
+				{
+					"name": "CIVILITE",
+					"type": "INTEGER",
+					"mode": "NULLABLE",
+					"key": "-",
+					"description": "Civilité de l'individu utilisée pour la personnalisation de la communication client. Information essentielle pour l'adressage correct dans les communications marketing et commerciales."
+				},
+				{
+					"name": "SEXE",
+					"type": "INTEGER",
+					"mode": "NULLABLE",
+					"key": "-",
+					"allowed_values": [
+						0,
+						1,
+						2
+					],
+					"description": "Genre du client avec les valeurs suivantes : 0 (Non renseigné), 1 (Homme), 2 (Femme). Information utilisée pour la segmentation client, la personnalisation des communications et l'analyse démographique de la clientèle."
+				},
+				{
+					"name": "DATE_NAISS_A",
+					"type": "STRING",
+					"mode": "NULLABLE",
+					"key": "-",
+					"description": "Année de naissance du client. Utilisée pour les analyses démographiques, le calcul de l'âge, et le ciblage marketing en fonction des tranches d'âge."
+				},
+				{
+					"name": "DATE_NAISS_M",
+					"type": "STRING",
+					"mode": "NULLABLE",
+					"key": "-",
+					"description": "Mois de naissance du client. Utilisé en combinaison avec le jour pour les communications anniversaire et les offres personnalisées."
+				},
+				{
+					"name": "DATE_NAISS_J",
+					"type": "STRING",
+					"mode": "NULLABLE",
+					"key": "-",
+					"description": "Jour de naissance du client. Utilisé en combinaison avec le mois pour les communications anniversaire et les offres personnalisées."
+				},
+				{
+					"name": "DATE_CREATION",
+					"type": "STRING",
+					"mode": "NULLABLE",
+					"key": "-",
+					"description": "Date de création de la carte de fidélité. Marque le début de la relation client et permet de calculer l'ancienneté. Utilisée pour les analyses de fidélisation et les programmes de récompense."
+				}
+			]
+		},
+		{
+			"name": "magasin",
+			"description": "Référentiel des points de vente.",
+			"fields": [
+				{
+					"name": "CODE_BOUTIQUE",
+					"type": "INTEGER",
+					"mode": "NULLABLE",
+					"key": "PRIMARY_KEY",
+					"description": "Code unique identifiant le magasin, également appelé boutique. Clé primaire utilisée comme référence dans tout le système pour identifier les points de vente."
+				},
+				{
+					"name": "ID_BOUTIQUE",
+					"type": "INTEGER",
+					"mode": "NULLABLE",
+					"key": "-",
+					"description": "Identifiant secondaire de la boutique utilisé par certains systèmes connexes. Permet la compatibilité avec d'autres systèmes de gestion."
+				},
+				{
+					"name": "REGIONS",
+					"type": "STRING",
+					"mode": "NULLABLE",
+					"key": "-",
+					"description": "Région d'implantation du magasin. Paris ou province. Utilisée pour les analyses géographiques et la gestion territoriale du réseau."
+				},
+				{
+					"name": "VILLE",
+					"type": "STRING",
+					"mode": "NULLABLE",
+					"key": "-",
+					"description": "Ville d'implantation du magasin. Utilisée pour les analyses géographiques et la gestion territoriale du réseau."
+				},
+				{
+					"name": "CDP",
+					"type": "INTEGER",
+					"mode": "NULLABLE",
+					"key": "-",
+					"description": "Code postal du magasin. Utilisé pour la géolocalisation précise et les analyses de zone de chalandise."
+				},
+				{
+					"name": "CENTRE_VILLE",
+					"type": "STRING",
+					"mode": "NULLABLE",
+					"key": "-",
+					"description": "Indicateur de localisation en centre-ville, de la typologie de l'emplacement. Permet de différencier les magasins de centre-ville des magasins de périphérie pour les analyses de performance."
+				},
+				{
+					"name": "CONCEPT",
+					"type": "STRING",
+					"mode": "NULLABLE",
+					"key": "-",
+					"description": "Type de concept commercial du magasin. Définit le positionnement et le format du point de vente pour adapter l'offre et la stratégie commerciale."
+				},
+				{
+					"name": "TYPE_MAGASIN",
+					"type": "STRING",
+					"mode": "NULLABLE",
+					"key": "-",
+					"description": "Typologie du point de vente caractérisant son mode de gestion. Différencie les succursales des franchises et autres formats pour la gestion du réseau."
+				}
+			]
+		},
+		{
+			"name": "referentiel",
+			"description": "Référentiel articles.",
+			"fields": [
+				{
+					"name": "ID_ARTICLE",
+					"type": "INTEGER",
+					"mode": "NULLABLE",
+					"key": "PRIMARY_KEY",
+					"description": "Identifiant unique de l'article. Clé primaire permettant d'identifier chaque article de manière unique dans le catalogue produits."
+				},
+				{
+					"name": "ID_MODELE",
+					"type": "STRING",
+					"mode": "NULLABLE",
+					"key": "-",
+					"description": "Identifiant du modèle de l'article. Permet de regrouper les différentes variations d'un même modèle de produit."
+				},
+				{
+					"name": "EAN",
+					"type": "STRING",
+					"mode": "NULLABLE",
+					"key": "-",
+					"description": "Code-barres de l'article, du produit. Utilisé pour l'identification physique des produits et la gestion des stocks."
+				}
+			]
+		},
+		{
+			"name": "ticket_caisse",
+			"description": "Transactions de vente détaillées.",
+			"fields": [
+				{
+					"name": "EAN",
+					"type": "STRING",
+					"mode": "NULLABLE",
+					"key": "-",
+					"description": "Code unique d'annulation pour les transactions annulées. Permet de tracer et gérer les annulations de ventes et les remboursements."
+				},
+				{
+					"name": "CODE_LIGNE",
+					"type": "INTEGER",
+					"mode": "NULLABLE",
+					"key": "-",
+					"description": "Code identifiant du produit vendu. Permet de relier la vente au référentiel produits et d'analyser les ventes par article."
+				},
+				{
+					"name": "CODE_VENDEUR",
+					"type": "INTEGER",
+					"mode": "NULLABLE",
+					"key": "-",
+					"description": "Identifiant du vendeur ayant réalisé la vente. Utilisé pour le suivi des performances commerciales par vendeur et la commission."
+				},
+				{
+					"name": "CODE_BOUTIQUE",
+					"type": "INTEGER",
+					"mode": "NULLABLE",
+					"key": "FOREIGN_KEY -> magasin.CODE_BOUTIQUE",
+					"description": "Code du point de vente où la transaction a été effectuée. Permet l'analyse des ventes par magasin et le suivi de la performance des points de vente."
+				},
+				{
+					"name": "ID_INDIVIDU",
+					"type": "INTEGER",
+					"mode": "NULLABLE",
+					"key": "FOREIGN_KEY -> individu.ID_INDIVIDU",
+					"description": "Identifiant du client ayant effectué l'achat. Permet de relier la transaction au client pour l'historique d'achat et les analyses comportementales."
+				},
+				{
+					"name": "ID_FOYER",
+					"type": "INTEGER",
+					"mode": "NULLABLE",
+					"key": "-",
+					"description": "Identifiant du foyer du client. Permet l'analyse des achats au niveau du foyer et la personnalisation des offres familiales."
+				},
+				{
+					"name": "DATE_TICKET",
+					"type": "STRING",
+					"mode": "NULLABLE",
+					"key": "-",
+					"format": "DD/MM/YYYY",
+					"description": "Date de création du ticket de caisse au format JJ/MM/AAAA. Utilisée pour toutes les analyses temporelles des ventes, le reporting quotidien, et le suivi de la saisonnalité des ventes. Essentielle pour le calcul des indicateurs de performance périodiques et l'analyse des tendances commerciales."
+				},
+				{
+					"name": "NUM_TICKET",
+					"type": "INTEGER",
+					"mode": "NULLABLE",
+					"key": "PRIMARY_KEY",
+					"description": "Numéro unique du ticket de caisse. Clé primaire permettant d'identifier de manière unique chaque transaction dans le système."
+				},
+				{
+					"name": "QUANTITE",
+					"type": "INTEGER",
+					"mode": "NULLABLE",
+					"key": "-",
+					"description": "Quantité de produits achetés dans la transaction. Utilisée pour le suivi des volumes de vente et la gestion des stocks."
+				},
+				{
+					"name": "PRIX_AP_REMISE",
+					"type": "INTEGER",
+					"mode": "NULLABLE",
+					"key": "-",
+					"description": "Prix de vente unitaire du produit au moment de la transaction, après remise. Pour calculer le chiffre d'affaires (montant total) d'une ligne, multipliez ce champ par QUANTITE. Aucune colonne MONTANT n'existe : toujours utiliser PRIX_AP_REMISE * QUANTITE pour obtenir le total de la ligne."
+				},
+				{
+					"name": "REMISE",
+					"type": "INTEGER",
+					"mode": "NULLABLE",
+					"key": "-",
+					"description": "Montant de la remise accordée sur la vente. Permet le suivi des réductions et l'analyse de l'impact des promotions."
+				},
+				{
+					"name": "REMISE_VALEUR",
+					"type": "INTEGER",
+					"mode": "NULLABLE",
+					"key": "-",
+					"description": "Montant de la remise accordée sur la vente, en pourcentage. Permet le suivi des réductions et l'analyse de l'impact des promotions."
+				},
+				{
+					"name": "ANNULATION",
+					"type": "BOOLEAN",
+					"mode": "NULLABLE",
+					"key": "-",
+					"description": "Flag indiquant si la transaction a été annulée. Permet de filtrer les transactions valides pour les analyses de vente."
+				},
+				{
+					"name": "ANNULATION_IMMEDIATE",
+					"type": "BOOLEAN",
+					"mode": "NULLABLE",
+					"key": "-",
+					"description": "Flag indiquant une annulation immédiate du ticket. Utilisé pour distinguer les annulations immédiates des retours ultérieurs."
+				},
+				{
+					"name": "NUM_TICKET_ANNUL",
+					"type": "BOOLEAN",
+					"mode": "NULLABLE",
+					"key": "-",
+					"description": "Numéro du ticket d'annulation lié. Permet de faire le lien entre une vente et son annulation éventuelle."
+				}
+			]
+		},
+		{
+			"name": "typo_produit",
+			"description": "Typologie produits par modèle.",
+			"fields": [
+				{
+					"name": "ID_MODELE",
+					"type": "STRING",
+					"mode": "NULLABLE",
+					"key": "FOREIGN_KEY -> referentiel.ID_MODELE",
+					"description": "Identifiant du modèle. Clé étrangère reliant la typologie au référentiel des modèles de produits."
+				},
+				{
+					"name": "LIGNE",
+					"type": "STRING",
+					"mode": "NULLABLE",
+					"key": "-",
+					"description": "Ligne de produit définissant la catégorie principale du produit. Utilisée pour le positionnement marketing et la segmentation de l'offre."
+				},
+				{
+					"name": "FAMILLE",
+					"type": "STRING",
+					"mode": "NULLABLE",
+					"key": "-",
+					"description": "Famille de produit indiquant le type de vêtement ou d'accessoire. Utilisée pour la classification et la recherche de produits."
+				},
+				{
+					"name": "LIBELLE_MODELE",
+					"type": "STRING",
+					"mode": "NULLABLE",
+					"key": "-",
+					"description": "Description marketing du modèle de produit. Utilisée pour la communication client et l'affichage dans les interfaces de vente."
+				}
+			]
+		}
+	],
+	"relations": [
+		{
+			"left": "complement_individu.ID_INDIVIDU",
+			"right": "individu.ID_INDIVIDU",
+			"type": "LEFT"
+		},
+		{
+			"left": "ticket_caisse.CODE_LIGNE",
+			"right": "referentiel.ID_ARTICLE",
+			"type": "LEFT"
+		},
+		{
+			"left": "referentiel.ID_MODELE",
+			"right": "typo_produit.ID_MODELE",
+			"type": "LEFT"
+		},
+		{
+			"left": "ticket_caisse.CODE_BOUTIQUE",
+			"right": "magasin.CODE_BOUTIQUE",
+			"type": "LEFT"
+		},
+		{
+			"left": "ticket_caisse.ID_INDIVIDU",
+			"right": "individu.ID_INDIVIDU",
+			"type": "LEFT"
+		}
+	],
+	"concepts": {
+    "metrics": [
+      {
+        "name": "chiffre d'affaires",
+        "expression": "SUM(t.PRIX_AP_REMISE * t.QUANTITE)",
+        "description": "Le revenu total des ventes, calculé comme le prix après remise multiplié par la quantité."
+      },
+      {
+        "name": "quantité vendue",
+        "expression": "SUM(t.QUANTITE)",
+        "description": "Le nombre total d'articles vendus."
+      },
+      {
+        "name": "panier moyen",
+        "expression": "AVG(t.PRIX_AP_REMISE * t.QUANTITE)",
+        "description": "La valeur moyenne d'une transaction."
+      }
+    ],
+    "dimensions": [
+      {
+        "name": "famille produit",
+        "expression": "p.FAMILLE",
+        "description": "La catégorie principale d'un produit (ex: chemises, pantalons)."
+      },
+      {
+        "name": "ville magasin",
+        "expression": "m.VILLE",
+        "description": "La ville où la vente a eu lieu."
+      }
+    ]
+  }
+}

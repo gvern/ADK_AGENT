@@ -1,754 +1,313 @@
-# @title 1) Define the before_model_callback Guardrail (keyword block)
+# -*- coding: utf-8 -*-
+"""
+Data Orchestrator Agents (v3) for Reine des Maracas.
+This version implements a flexible, multi-agent architecture where a root
+orchestrator routes tasks to specialized sub-agents (UX, Metadata, SQL, Viz).
+"""
 
-from typing import Optional, Dict, Any, List, cast
-from google.genai import types
+from __future__ import annotations
+
 import os
+import re
 import json
-from urllib.parse import urlencode, quote_plus
-import math
 import logging
+import asyncio
+from datetime import date, timedelta
+from typing import Any, Dict, List, Optional
+from functools import lru_cache
+from collections import defaultdict
+
+import numpy as np
+from google.cloud import bigquery
+from google.api_core.exceptions import GoogleAPICallError
+from google.adk.agents.llm_agent import LlmAgent
+import vertexai
+from vertexai.language_models import TextEmbeddingModel
+
+# --- Vérification et importation des dépendances ---
 try:
-    import requests  # type: ignore
-except Exception:  # requests might not be installed in some envs
-    requests = None  # we'll guard at call sites
+    import vertexai
+    from vertexai.language_models import TextEmbeddingModel
+    VERTEXAI_AVAILABLE = True
+except ImportError:
+    VERTEXAI_AVAILABLE = False
 
-# Try Google ADK/GenAI imports, fallback to lightweight stubs for local importability
-try:
-    from google.adk.agents.callback_context import CallbackContext
-    from google.adk.models.llm_request import LlmRequest
-    from google.adk.models.llm_response import LlmResponse
-    from google.genai import types  # for response content
-except Exception:
-    class CallbackContext:  # type: ignore
-        def __init__(self, agent_name: str = "agent", state: Optional[Dict[str, Any]] = None):
-            self.agent_name = agent_name
-            self.state = state or {}
+# --- Configuration ---
+MODEL = os.getenv("DATA_MODEL", "gemini-1.5-flash-002")
+if os.getenv("VERTEX_PROJECT") and not os.getenv("VERTEXAI_PROJECT"):
+    os.environ["VERTEXAI_PROJECT"] = os.environ["VERTEX_PROJECT"]
+if os.getenv("VERTEX_LOCATION") and not os.getenv("VERTEXAI_LOCATION"):
+    os.environ["VERTEXAI_LOCATION"] = os.environ["VERTEXAI_LOCATION"]
+PROJECT = os.getenv("VERTEXAI_PROJECT", "avisia-training")
+LOCATION = os.getenv("VERTEXAI_LOCATION", "europe-west1")
+DATASET = os.getenv("VERTEX_BQ_DATASET", "reine_des_maracas")
+DESCRIPTION_PATH = os.getenv("SQL_SCHEMA_PATH", "./table_description.json")
+EXAMPLES_PATH = os.getenv("SQL_EXAMPLES_PATH", "./sql_examples.json")
 
-    class _TypesPart:
-        def __init__(self, text: str = ""):
-            self.text = text
+if VERTEXAI_AVAILABLE:
+    try:
+        if PROJECT:
+            vertexai.init(project=PROJECT, location=LOCATION)
+            logging.info(f"Vertex AI SDK initialized for project '{PROJECT}' in '{LOCATION}'.")
+    except Exception as e:
+        logging.warning(f"Could not initialize Vertex AI SDK. Error: {e}")
+        VERTEXAI_AVAILABLE = False
+else:
+    logging.warning("Vertex AI SDK not found. Install 'google-cloud-aiplatform' to enable semantic search.")
 
-    class _TypesContent:
-        def __init__(self, role: str = "model", parts: Optional[List[Any]] = None):
-            self.role = role
-            self.parts = parts or []
+# --- Gestion du Schéma ---
+def _bq_client() -> Optional[bigquery.Client]:
+    try:
+        if not PROJECT: return None
+        return bigquery.Client(project=PROJECT, location=os.getenv("BQ_LOCATION"))
+    except Exception as e:
+        logging.warning(f"Le client BigQuery n'a pas pu être initialisé : {e}")
+        return None
 
-    class types:  # type: ignore
-        Content = _TypesContent
-        Part = _TypesPart
+@lru_cache(maxsize=1)
+def get_enriched_schema() -> Dict[str, Any]:
+    client = _bq_client()
+    live_schema: Dict[str, Any] = {"tables": []}
+    descriptions = _load_static_descriptions()
+    table_descriptions = {t["name"]: t for t in descriptions.get("tables", [])}
+    if client and DATASET:
+        try:
+            query = f"SELECT table_name, column_name, data_type FROM `{PROJECT}.{DATASET}.INFORMATION_SCHEMA.COLUMNS` ORDER BY table_name, ordinal_position;"
+            rows = client.query(query).result()
+            tables_temp: Dict[str, Dict[str, Any]] = defaultdict(lambda: {"fields": []})
+            for row in rows:
+                tables_temp[row.table_name]["name"] = row.table_name
+                tables_temp[row.table_name]["fields"].append({"name": row.column_name, "type": row.data_type})
+            for name, table_data in tables_temp.items():
+                enriched_table = table_descriptions.get(name, {})
+                field_descriptions = {f["name"]: f for f in enriched_table.get("fields", [])}
+                merged_fields = [{**live_field, **field_descriptions.get(live_field["name"], {})} for live_field in table_data["fields"]]
+                live_schema["tables"].append({"name": name, "description": enriched_table.get("description", ""), "fields": merged_fields})
+            logging.info(f"Schéma chargé et enrichi pour {len(live_schema['tables'])} tables.")
+        except GoogleAPICallError as e:
+            logging.warning(f"Échec de la récupération du schéma live : {e}. Utilisation du schéma statique.")
+            return descriptions
+    return live_schema
 
-    class LlmRequest:  # type: ignore
-        def __init__(self, contents: Optional[List[Any]] = None):
-            self.contents = contents or []
+def _load_static_descriptions() -> Dict[str, Any]:
+    try:
+        if os.path.exists(DESCRIPTION_PATH):
+            with open(DESCRIPTION_PATH, "r", encoding="utf-8") as f: return json.load(f)
+    except (IOError, json.JSONDecodeError) as e:
+        logging.warning(f"Impossible de charger le fichier de description du schéma : {e}")
+    return {"tables": []}
 
-    class LlmResponse:  # type: ignore
-        def __init__(self, content: Any = None):
-            self.content = content
-import os
-from google import genai
-import os
-from google import genai
+@lru_cache(maxsize=1)
+def _load_sql_examples() -> List[Dict[str, Any]]:
+    try:
+        if os.path.exists(EXAMPLES_PATH):
+            with open(EXAMPLES_PATH, "r", encoding="utf-8") as f: return json.load(f)
+    except (IOError, json.JSONDecodeError) as e:
+        logging.warning(f"Impossible de charger les exemples SQL : {e}")
+    return []
 
-# --- Bootstrap Vertex AI (respecte tes exports VERTEXAI_PROJECT/LOCATION) ---
-PROJECT  = os.environ.get("VERTEXAI_PROJECT", "avisia-training")
-LOCATION = os.environ.get("VERTEXAI_LOCATION", "europe-west1")
-if not PROJECT or not LOCATION:
-    raise RuntimeError("VERTEXAI_PROJECT et VERTEXAI_LOCATION doivent être définies")
+# --- Moteur de Recherche Sémantique ---
+class EmbeddingClient:
+    def __init__(self, model_name: str = "text-embedding-004"):
+        if not VERTEXAI_AVAILABLE: raise RuntimeError("Le SDK Vertex AI n'est pas disponible.")
+        self.model = TextEmbeddingModel.from_pretrained(model_name)
+    def get_embeddings(self, texts: List[str]) -> np.ndarray:
+        if not texts: return np.array([])
+        try:
+            return np.array([e.values for e in self.model.get_embeddings(texts)])
+        except Exception as e:
+            logging.error(f"Échec de l'obtention des embeddings : {e}")
+            return np.zeros((len(texts), 768))
 
-GENAI_VERTEX_CLIENT = genai.Client(vertexai=True, project=PROJECT, location=LOCATION)
+class SemanticIndex:
+    def __init__(self, metadata: List[Dict[str, Any]], vectors: np.ndarray, client: EmbeddingClient):
+        self.metadata = metadata
+        self.vectors = vectors
+        self.client = client
+        self._normalize_vectors()
+    def _normalize_vectors(self):
+        norms = np.linalg.norm(self.vectors, axis=1, keepdims=True)
+        self.normalized_vectors = np.divide(self.vectors, norms, out=np.zeros_like(self.vectors), where=norms!=0)
+    @staticmethod
+    def create(schema: Dict[str, Any], client: EmbeddingClient) -> "SemanticIndex":
+        logging.info("Construction de l'index sémantique...")
+        docs, metadata = [], []
+        for table in schema.get("tables", []):
+            for field in table.get("fields", []):
+                doc = f"Table: {table.get('name', '')}. Colonne: {field.get('name', '')}. Description: {field.get('description', '')}."
+                docs.append(doc)
+                metadata.append({"table": table.get('name', ''), "field": field.get('name', '')})
+        vectors = client.get_embeddings(docs)
+        logging.info(f"Index sémantique construit avec {len(metadata)} entrées.")
+        return SemanticIndex(metadata, vectors, client)
+    def search(self, query: str, top_k: int = 10) -> List[Dict[str, Any]]:
+        query_vec = self.client.get_embeddings([query])
+        query_norm = query_vec / np.linalg.norm(query_vec)
+        sims = np.dot(self.normalized_vectors, query_norm.T).flatten()
+        indices = np.argpartition(sims, -top_k)[-top_k:]
+        sorted_indices = indices[np.argsort(-sims[indices])]
+        return [{**self.metadata[i], "score": sims[i]} for i in sorted_indices]
 
-os.environ.setdefault("VERTEXAI_PROJECT", "avisia-training")
-os.environ.setdefault("VERTEXAI_LOCATION", "europe-west1")
-_genai = genai.Client(vertexai=True,
-                      project=os.environ["VERTEXAI_PROJECT"],
-                      location=os.environ["VERTEXAI_LOCATION"])
+_SEMANTIC_INDEX: Optional[SemanticIndex] = None
+def _initialize_components():
+    global _SEMANTIC_INDEX
+    if VERTEXAI_AVAILABLE and not _SEMANTIC_INDEX:
+        client = EmbeddingClient()
+        schema = get_enriched_schema()
+        _SEMANTIC_INDEX = SemanticIndex.create(schema, client)
+
+# --- Outils pour les Agents ---
+def find_relevant_schema(question: str) -> Dict[str, Any]:
+    """Trouve les tables et colonnes les plus pertinentes pour une question."""
+    if not _SEMANTIC_INDEX: return {"error": "L'index sémantique n'est pas initialisé."}
+    
+    search_results = _SEMANTIC_INDEX.search(question, top_k=15)
+    
+    table_context = defaultdict(list)
+    for res in search_results:
+        if res['score'] > 0.6: # Augmenter le seuil de pertinence
+            table_context[res['table']].append(res['field'])
+            
+    # Retourner un objet JSON propre, pas une chaîne formatée
+    return {"relevant_tables": dict(table_context)}
+
+def rag_sql_examples(question: str) -> Dict[str, Any]:
+    """Récupère des exemples de questions-SQL similaires à la question de l'utilisateur."""
+    if not _SEMANTIC_INDEX: return {"examples": "L'index sémantique n'est pas initialisé."}
+    
+    examples = _load_sql_examples()
+    if not examples: return {"examples": "Aucun exemple SQL disponible."}
+    
+    example_questions = [ex['question'] for ex in examples]
+    all_texts = [question] + example_questions
+    all_embeddings = _SEMANTIC_INDEX.client.get_embeddings(all_texts)
+    
+    q_vec = all_embeddings[0]
+    ex_vecs = all_embeddings[1:]
+    
+    sims = np.dot(ex_vecs, q_vec.T) / (np.linalg.norm(ex_vecs, axis=1) * np.linalg.norm(q_vec))
+    
+    top_indices = np.argsort(-sims)[:3]
+    
+    # Retourner une liste d'objets JSON, pas une chaîne formatée
+    top_examples = [examples[i] for i in top_indices]
+    return {"examples": top_examples}
+
+def run_sql(query: str) -> Dict[str, Any]:
+    """Exécute une requête SQL SELECT-only sur BigQuery."""
+    if not query: return {"error": "Requête vide reçue."}
+    
+    # Nettoyage simple des ```sql
+    if match := re.compile(r"^\s*```(?:sql)?\s*([\s\S]*?)\s*```\s*$", re.IGNORECASE).match(query): query = match.group(1)
+    final_query = query.strip()
+
+    if not re.compile(r"^\s*SELECT\b", re.IGNORECASE).search(final_query):
+        return {"error": "Seules les requêtes SELECT sont autorisées."}
+
+    client = _bq_client()
+    if not client: return {"error": "Client BigQuery non disponible."}
+    
+    try:
+        job = client.query(final_query)
+        rows = list(job.result(max_results=1000))
+        if not rows: return {"result": "La requête a fonctionné mais n'a retourné aucune ligne."}
+        
+        cols = [sf.name for sf in job.schema]
+        data = [{col: row[i] for i, col in enumerate(cols)} for row in rows]
+        return {"result": json.dumps(data, indent=2, default=str)}
+    except Exception as e:
+        logging.error(f"Échec du job SQL : {e} sur la requête : {final_query}")
+        return {"error": f"Erreur lors de l'exécution de la requête : {str(e)}"}
 
 
-# fallback si tu gardes tes anciens noms .env
-os.environ.setdefault("VERTEXAI_PROJECT", os.getenv("VERTEX_PROJECT", "avisia-training"))
-os.environ.setdefault("VERTEXAI_LOCATION", os.getenv("VERTEX_LOCATION", "europe-west1"))
+def chart_spec(data_json: str, user_intent: str) -> Dict[str, Any]:
+    """Génère une spécification Vega-Lite basique."""
+    try:
+        data = json.loads(data_json)
+        if not isinstance(data, list) or not data:
+            return {"spec": "Données invalides ou vides."}
+    except json.JSONDecodeError:
+        return {"spec": "Erreur de formatage des données d'entrée (JSON invalide)."}
 
-# construit explicitement un client Vertex
-_vertex = genai.Client(
-    vertexai=True,
-    project=os.environ["VERTEXAI_PROJECT"],
-    location=os.environ["VERTEXAI_LOCATION"],
+    cols = list(data[0].keys())
+    if len(cols) < 2: return {"spec": "Pas assez de colonnes pour un graphique."}
+    
+    x_field, y_field = None, None
+    for col in cols:
+        val = data[0][col]
+        if isinstance(val, (int, float)) and not y_field:
+            y_field = col
+        elif isinstance(val, str) and not x_field:
+            x_field = col
+    
+    if not x_field or not y_field:
+        x_field, y_field = cols[0], cols[1]
+
+    mark = "line" if any(kw in user_intent for kw in ["évolution", "tendance", "courbe"]) else "bar"
+    
+    spec = {
+        "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+        "data": {"values": data},
+        "mark": {"type": mark, "tooltip": True},
+        "encoding": {
+            "x": {"field": x_field, "type": "nominal", "axis": {"labelAngle": -45}},
+            "y": {"field": y_field, "type": "quantitative"},
+        },
+    }
+    return {"vega_lite_spec": json.dumps(spec, indent=2)}
+
+# --- Définitions des Agents ---
+
+ux_agent = LlmAgent(
+    name="ux_agent", model=MODEL,
+    description="Clarifie les questions vagues des utilisateurs.",
+    instruction="Ta tâche est de reformuler la question de l'utilisateur ou de poser une question de clarification si elle est trop vague. Sois concis. Ne réponds qu'avec la clarification.",
 )
 
-def block_keyword_guardrail(
-    callback_context: CallbackContext, llm_request: LlmRequest
-) -> Optional[LlmResponse]:
-    """
-    Guardrail: bloque la requête si elle contient le mot-clé 'BLOCK' (EN) ou 'BLOQUE' (FR).
-    Sinon, laisse passer vers le LLM.
-    """
-    agent_name = callback_context.agent_name
-    print(f"--- Callback: block_keyword_guardrail for agent: {agent_name} ---")
-
-    last_user_message_text = ""
-    if llm_request.contents:
-        for content in reversed(llm_request.contents):
-            if content.role == "user" and content.parts and getattr(content.parts[0], "text", None):
-                last_user_message_text = content.parts[0].text
-                break
-
-    print(f"--- Inspecting last user message: '{last_user_message_text[:120]}...' ---")
-
-    blocked_terms = {"BLOCK", "BLOQUE"}
-    if any(term in last_user_message_text.upper() for term in blocked_terms):
-        callback_context.state["guardrail_block_keyword_triggered"] = True
-        print(f"--- Found a blocked keyword. Blocking LLM call. ---")
-        return LlmResponse(
-            content=types.Content(
-                role="model",
-                parts=[types.Part(text="Demande bloquée par la politique de sécurité (mot-clé interdit).")],
-            )
-        )
-    return None
-
-print("✅ block_keyword_guardrail function defined.")
-
-# @title 2) Define Tools (stubs) for SAV & Sales — swap with your MCP/RAG/GMaps
-
-from dataclasses import dataclass
-from typing import Dict, Any, List, Optional
-
-# ── SAV TOOLS ────────────────────────────────────────────────────────────────
-# 1) RAG: politique de retour / remboursement (remplacer par ton store vectoriel)
-def rag_return_policy(question: str) -> Dict[str, Any]:
-    """
-    RAG pour la politique de retours/remboursements « Reine des Maracas ».
-
-    Ordre des backends (auto-détecté):
-    1) MCP → agentspace.search (Vertex AI Search/Agentspace) avec BigQuery (avisia-training.reine_des_maracas, europe-west1)
-       - Configurez MCP_HTTP_URL pour pointer vers votre passerelle MCP.
-       - Optionnel: AGENTSPACE_URL pour préciser l'Agentspace (sinon valeur par défaut ci-dessous).
-    2) CHROMA (si CHROMA_PATH et chromadb installés) → collection « reine_des_maracas_policies »
-    3) Fallback local (matching Jaccard) pour garder le script fonctionnel.
-
-    Retourne: {"answer": str, "sources": List[str]}
-    """
-
-    q = (question or "").strip()
-    if not q:
-        return {"answer": "Veuillez préciser votre question sur les retours/remboursements.", "sources": []}
-
-    # 1) MCP Agentspace (Vertex AI Search)
-    try:
-        agentspace_url_env = os.getenv(
-            "AGENTSPACE_URL",
-            # Valeur fournie par l'utilisateur (UI). L'outil MCP saura l'utiliser si pertinent.
-            "https://vertexaisearch.cloud.google.com/eu/home/cid/6a59ad39-5ee7-41c7-ae22-021eb8cc1998?hl=en_GB",
-        )
-        project = os.getenv("VERTEX_PROJECT", "avisia-training")
-        dataset = os.getenv("VERTEX_BQ_DATASET", "reine_des_maracas")
-        location = os.getenv("VERTEX_LOCATION", "europe-west1")
-        bq_ctx = _bigquery_ctx()
-        # Si une passerelle MCP est configurée, on tente agentspace.search
-        if os.getenv("MCP_HTTP_URL"):
-            res = _call_mcp_tool(
-                "agentspace.search",
-                {
-                    "query": q,
-                    "agentspace_url": agentspace_url_env,
-                    "project": project,
-                    "location": location,
-                    "bigquery": bq_ctx,
-                    "top_k": 3,
-                    "scope": ["returns", "refunds", "policy"],
-                },
-            )
-            if isinstance(res, dict) and "answer" in res:
-                ans = str(res.get("answer") or "")
-                sources = res.get("sources") or res.get("documents") or []
-                if isinstance(sources, list):
-                    srcs = [str(s) for s in sources]
-                else:
-                    srcs = [str(sources)]
-                if ans:
-                    return {"answer": ans, "sources": srcs}
-    except Exception as e:
-        logging.warning(f"agentspace.search via MCP a échoué; fallback: {e}")
-
-    # 2) CHROMA backend (optionnel)
-    try:
-        chroma_path = os.getenv("CHROMA_PATH")
-        if chroma_path:
-            import chromadb  # type: ignore
-            client = chromadb.PersistentClient(path=chroma_path)
-            coll_name = os.getenv("CHROMA_COLLECTION", "reine_des_maracas_policies")
-            coll = client.get_or_create_collection(name=coll_name)
-            # On suppose que la collection a été créée avec une embedding_function compatible
-            res = coll.query(query_texts=[q], n_results=3)
-            docs = (res.get("documents") or [[]])[0]
-            metadatas = (res.get("metadatas") or [[]])[0]
-            if docs:
-                answer = docs[0]
-                sources: List[str] = []
-                for md in metadatas:
-                    src = (md or {}).get("source") if isinstance(md, dict) else None
-                    if src:
-                        sources.append(str(src))
-                if not sources:
-                    # fallback metadata-less: use collection/id references
-                    ids = (res.get("ids") or [[]])[0]
-                    sources = [f"chroma://{coll_name}/{i}" for i in ids]
-                return {"answer": str(answer), "sources": sources[:3]}
-    except Exception as e:
-        logging.warning(f"CHROMA RAG indisponible; fallback: {e}")
-
-    # 3) Fallback local: mini-KB + Jaccard
-    KB_DOCS: List[Dict[str, str]] = [
-        {
-            "id": "returns_policy_v1",
-            "source": "kb://returns_policy_v1",
-            "text": (
-                "Politique de retours: Vous disposez de 30 jours après réception pour retourner un article. "
-                "Le produit doit être neuf, non porté, avec étiquettes et dans son emballage d'origine. "
-                "Après validation en entrepôt, le remboursement est effectué sous 5 à 7 jours ouvrés. "
-                "Les frais de retour sont offerts pour les retours depuis la France métropolitaine."
-            ),
-        },
-        {
-            "id": "refunds_faq_v2",
-            "source": "kb://faq_refunds_v2",
-            "text": (
-                "Remboursements: Les remboursements sont crédités sur le moyen de paiement initial. "
-                "Délais typiques: 5 à 7 jours ouvrés après validation. Les échanges sont possibles selon stock."
-            ),
-        },
-    ]
-
-    def _tokenize(s: str) -> set:
-        return {t.lower() for t in ''.join(ch if ch.isalnum() else ' ' for ch in s).split() if t}
-
-    q_tokens = _tokenize(q)
-    best = None
-    best_score = -1.0
-    for d in KB_DOCS:
-        d_tokens = _tokenize(d["text"])
-        inter = len(q_tokens & d_tokens)
-        union = len(q_tokens | d_tokens) or 1
-        score = inter / union
-        if score > best_score:
-            best = d
-            best_score = score
-
-    if best:
-        return {"answer": best["text"], "sources": [best["source"]]}
-    combined = " \n\n".join(d["text"] for d in KB_DOCS)
-    return {"answer": combined, "sources": [d["source"] for d in KB_DOCS]}
-
-# 2) MCP: statut de commande (expose ton endpoint via MCP server)
-def _call_mcp_tool(tool_name: str, arguments: Dict[str, Any]) -> Any:
-    """
-    Generic MCP HTTP invocation.
-
-    Configure via env:
-      - MCP_HTTP_URL: Base URL of your MCP HTTP gateway (e.g., https://mcp.mycompany.com)
-      - MCP_HTTP_INVOKE_PATH: Path to invoke tools (default: /tools/invoke)
-
-    Payload expected by gateway: {"tool": str, "arguments": dict}
-    Response expected: JSON dict with either direct fields or under 'result'.
-    """
-    base = os.getenv("MCP_HTTP_URL")
-    if not base:
-        raise RuntimeError("MCP_HTTP_URL not set; can't invoke MCP tools. Configure an HTTP gateway or add a stdio client.")
-    if requests is None:
-        raise RuntimeError("'requests' is not available; install it to call MCP HTTP gateway.")
-    path = os.getenv("MCP_HTTP_INVOKE_PATH", "/tools/invoke")
-    url = base.rstrip("/") + path
-    headers = {}
-    bearer = os.getenv("MCP_HTTP_BEARER")
-    if bearer:
-        headers["Authorization"] = f"Bearer {bearer}"
-    try:
-        r = requests.post(url, json={"tool": tool_name, "arguments": arguments}, headers=headers or None, timeout=20)
-        r.raise_for_status()
-        data = r.json()
-        if isinstance(data, dict) and "result" in data:
-            return data["result"]
-        return data
-    except Exception as e:
-        raise RuntimeError(f"MCP call failed for {tool_name}: {e}")
-
-def _bigquery_ctx() -> Dict[str, Any]:
-    project = os.getenv("VERTEX_PROJECT", "avisia-training")
-    dataset = os.getenv("VERTEX_BQ_DATASET", "reine_des_maracas")
-    location = os.getenv("VERTEX_LOCATION", "europe-west1")
-    # If explicit table list provided, use it; else default to known tables
-    tables_env = os.getenv("VERTEX_BQ_TABLES")
-    if tables_env:
-        tables = [t.strip() for t in tables_env.split(",") if t.strip()]
-    else:
-        tables = [
-            "complement_individu",
-            "individu",
-            "magasin",
-            "referentiel",
-            "ticket_caisse",
-            "typo_produit",
-        ]
-    return {
-        "project": project,
-        "dataset": dataset,
-        "location": location,
-        "tables": tables,
-    }
-
-def mcp_check_order_status(order_id: str) -> Dict[str, Any]:
-    """
-    MCP tool: orders.get_status
-    """
-    try:
-        args = {"order_id": order_id, "bigquery": _bigquery_ctx()}
-        res = _call_mcp_tool("orders.get_status", args)
-        if isinstance(res, dict):
-            return cast(Dict[str, Any], res)
-        # If gateway returns a list or wrapped shape
-        return {"order_id": order_id, **(res or {})}
-    except Exception as e:
-        logging.warning(f"orders.get_status MCP failed, using fallback: {e}")
-        return {"order_id": order_id, "status": "Delivered", "delivered_at": "2025-09-04"}
-
-# 3) MCP: créer une étiquette de retour
-def mcp_create_return_label(order_id: str, reason: str) -> Dict[str, Any]:
-    """
-    MCP tool: returns.create_label
-    """
-    try:
-        args = {"order_id": order_id, "reason": reason, "bigquery": _bigquery_ctx()}
-        res = _call_mcp_tool("returns.create_label", args)
-        if isinstance(res, dict):
-            return cast(Dict[str, Any], res)
-        return {"order_id": order_id, "reason": reason, **(res or {})}
-    except Exception as e:
-        logging.warning(f"returns.create_label MCP failed, using fallback: {e}")
-        return {"order_id": order_id, "label_url": f"https://returns.example/label/{order_id}", "reason": reason}
-
-
-# ── SALES TOOLS ─────────────────────────────────────────────────────────────
-# 1) MCP: recherche produits (catégorie, filtres)
-def mcp_search_products(query: str, size: Optional[str] = None, color: Optional[str] = None, limit: int = 10) -> List[Dict[str, Any]]:
-    """
-    MCP tool: catalog.search
-    """
-    args: Dict[str, Any] = {"query": query, "limit": limit, "bigquery": _bigquery_ctx()}
-    if size:
-        args["size"] = size
-    if color:
-        args["color"] = color
-    try:
-        res = _call_mcp_tool("catalog.search", args)
-        if isinstance(res, list):
-            return cast(List[Dict[str, Any]], res)[:limit]
-        if isinstance(res, dict) and "items" in res and isinstance(res["items"], list):
-            return cast(List[Dict[str, Any]], res["items"])[:limit]
-        # Coerce single dict
-        if isinstance(res, dict):
-            return [cast(Dict[str, Any], res)]
-    except Exception as e:
-        logging.warning(f"catalog.search MCP failed, using fallback: {e}")
-    return [
-        {"sku": "BKN-TRI-001", "title": "Bikini triangle noir", "size": size or "S", "color": color or "noir", "price_eur": 39.9, "availability": "in_stock"},
-        {"sku": "SWM-ONE-PIECE-RED", "title": "Maillot 1 pièce rouge", "size": size or "M", "color": color or "rouge", "price_eur": 59.0, "availability": "low_stock"},
-    ][:limit]
-
-# 2) Google Maps: recherche magasins proches (mock)
-@dataclass
-class Store:
-    name: str
-    address: str
-    city: str
-    place_id: str
-    distance_km: float
-
-# Remplace la signature et les retours de gmaps_find_store par ceci
-from typing import Optional, Dict, Any, List
-import os, math, logging
-
-try:
-    import requests  # si tu l’as déjà importé ailleurs, laisse comme c’est
-except Exception:
-    requests = None
-
-def gmaps_find_store(city_or_address: str, limit: int = 5) -> List[Dict[str, Any]]:
-    """
-    Google Places API search for nearby stores matching 'Reine des Maracas'.
-
-    Args:
-        city_or_address: City name or full address used as origin for distance.
-        limit: Max results to return (default: 5).
-
-    Returns:
-        List[Dict[str, Any]] with JSON-serializable items:
-        [
-          {
-            "name": str,
-            "address": str,
-            "city": str,
-            "place_id": str,
-            "distance_km": float
-          },
-          ...
-        ]
-
-    Note:
-        Only JSON-friendly types are used to comply with ADK auto function calling.
-    """
-    api_key = os.getenv("GOOGLE_MAPS_API_KEY")
-    if not api_key or requests is None:
-        logging.warning("GOOGLE_MAPS_API_KEY not set or requests unavailable; using mock stores.")
-        return [
-            {
-                "name": "Reine des Maracas — Opéra",
-                "address": "12 Rue de la Paix, 75002 Paris",
-                "city": "Paris",
-                "place_id": "gmaps:opera-123",
-                "distance_km": 1.2,
-            },
-            {
-                "name": "Reine des Maracas — Marais",
-                "address": "5 Rue des Rosiers, 75004 Paris",
-                "city": "Paris",
-                "place_id": "gmaps:marais-456",
-                "distance_km": 2.4,
-            },
-        ][:limit]
-
-    def _geocode(q: str) -> Optional[Dict[str, float]]:
-        url = "https://maps.googleapis.com/maps/api/geocode/json"
-        params = {"address": q, "key": api_key}
-        try:
-            r = requests.get(url, params=params, timeout=15)
-            r.raise_for_status()
-            data = r.json()
-            if data.get("results"):
-                loc = data["results"][0]["geometry"]["location"]
-                return {"lat": float(loc["lat"]), "lng": float(loc["lng"])}
-        except Exception:
-            return None
-        return None
-
-    def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-        R = 6371.0
-        dlat = math.radians(lat2 - lat1)
-        dlon = math.radians(lon2 - lon1)
-        a = (
-            math.sin(dlat / 2) ** 2
-            + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2) ** 2
-        )
-        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-        return round(R * c, 2)
-
-    origin = _geocode(city_or_address)
-    text_query = f"Reine des Maracas near {city_or_address}"
-    url = "https://maps.googleapis.com/maps/api/place/textsearch/json"
-    params = {"query": text_query, "key": api_key}
-    results: List[Dict[str, Any]] = []
-
-    try:
-        r = requests.get(url, params=params, timeout=15)
-        r.raise_for_status()
-        data = r.json()
-        for item in (data.get("results") or [])[:limit]:
-            name = item.get("name") or "Reine des Maracas"
-            address = item.get("formatted_address") or item.get("vicinity") or ""
-            place_id = item.get("place_id") or ""
-            lat = (item.get("geometry") or {}).get("location", {}).get("lat")
-            lng = (item.get("geometry") or {}).get("location", {}).get("lng")
-            dist = 0.0
-            if origin and isinstance(lat, (int, float)) and isinstance(lng, (int, float)):
-                dist = _haversine_km(origin["lat"], origin["lng"], float(lat), float(lng))
-
-            # Récupération éventuelle de la ville via Place Details
-            city = ""
-            if place_id:
-                try:
-                    details_url = "https://maps.googleapis.com/maps/api/place/details/json"
-                    details_params = {
-                        "place_id": place_id,
-                        "key": api_key,
-                        "fields": "address_components,formatted_address",
-                    }
-                    dr = requests.get(details_url, params=details_params, timeout=10)
-                    dr.raise_for_status()
-                    ddata = dr.json()
-                    result = ddata.get("result") or {}
-                    address = result.get("formatted_address") or address
-                    comps = result.get("address_components") or []
-                    for comp in comps:
-                        if "locality" in comp.get("types", []):
-                            city = comp.get("long_name") or city
-                except Exception:
-                    pass
-
-            if not city and isinstance(address, str) and "," in address:
-                city = address.split(",")[-1].strip()
-
-            results.append(
-                {
-                    "name": name,
-                    "address": address,
-                    "city": city,
-                    "place_id": place_id,
-                    "distance_km": dist,
-                }
-            )
-
-        if results:
-            return results
-
-    except Exception as e:
-        logging.warning(f"Google Places API failed, using mock: {e}")
-
-    # Fallback mock si l’API échoue
-    return [
-        {
-            "name": "Reine des Maracas — Opéra",
-            "address": "12 Rue de la Paix, 75002 Paris",
-            "city": "Paris",
-            "place_id": "gmaps:opera-123",
-            "distance_km": 1.2,
-        },
-        {
-            "name": "Reine des Maracas — Marais",
-            "address": "5 Rue des Rosiers, 75004 Paris",
-            "city": "Paris",
-            "place_id": "gmaps:marais-456",
-            "distance_km": 2.4,
-        },
-    ][:limit]
-
-# 3) MCP: horaires magasin
-def mcp_get_store_hours(store_id: str) -> Dict[str, Any]:
-    """
-    MCP tool: stores.hours
-    """
-    try:
-        args = {"store_id": store_id, "bigquery": _bigquery_ctx()}
-        res = _call_mcp_tool("stores.hours", args)
-        if isinstance(res, dict):
-            return cast(Dict[str, Any], res)
-        return {"store_id": store_id, **(res or {})}
-    except Exception as e:
-        logging.warning(f"stores.hours MCP failed, using fallback: {e}")
-        hours = {
-            "mon-fri": "10:00–19:30",
-            "sat": "10:00–20:00",
-            "sun": "11:00–18:00",
-        }
-        return {"store_id": store_id, "hours": hours}
-
-# @title 3) Define Agents (SAV, Sales) + Root with guardrail
-
-# Assumes these are available from your environment; define defaults if not set.
-MODEL_GEMINI_2_0_FLASH = "gemini-1.5-flash-002"
-
-try:
-    from google.adk import Agent, Runner  # type: ignore
-except Exception:
-    Agent = None  # type: ignore
-    Runner = None  # type: ignore
-
-APP_NAME = "reine-des-maracas"
-print(f"✅ Using model: {MODEL_GEMINI_2_0_FLASH} | APP_NAME={APP_NAME}")
-
-# ── SAV Agent ───────────────────────────────────────────────────────────────
-if Agent is not None:
-    sav_agent = Agent(
-        model=MODEL_GEMINI_2_0_FLASH,
-        name="sav_agent",
-        description="Service Après-Vente Reine des Maracas: retours, remboursements, suivi commande.",
-        instruction=(
-            "Tu es l'agent SAV pour la boutique Reine des Maracas (maillots, sous-vêtements). "
-            "Réponds précisément aux questions sur retours/remboursements/suivi commande. "
-            "Utilise en priorité 'rag_return_policy' pour la politique officielle et cite les sources. "
-            "Pour le suivi/retour, utilise 'mcp_check_order_status' et 'mcp_create_return_label'. "
-            "Si la demande sort du périmètre SAV, explique poliment et renvoie au Root Agent."
-        ),
-        tools=[rag_return_policy, mcp_check_order_status, mcp_create_return_label],
-    )
-
-# ── Sales Agent ────────────────────────────────────────────────────────────
-if Agent is not None:
-    sales_agent = Agent(
-        model=MODEL_GEMINI_2_0_FLASH,
-        name="sales_agent",
-        description="Vente & magasins Reine des Maracas: recherche produit, disponibilité, adresses magasins.",
-        instruction=(
-            "Tu es l'agent Sales de Reine des Maracas. "
-            "Aide à trouver des produits (taille, couleur, prix) via 'mcp_search_products'. "
-            "Pour trouver des magasins et adresses, utilise 'gmaps_find_store' puis, si utile, 'mcp_get_store_hours'. "
-            "Structure les résultats (top 3), fais des suggestions (upsell/cross-sell) avec tact, "
-            "et propose un plan d’action clair (acheter en ligne, réserver en boutique, etc.)."
-        ),
-        tools=[mcp_search_products, gmaps_find_store, mcp_get_store_hours],
-    )
-
-    print(f"✅ Sub-Agents ready: {sav_agent.name}, {sales_agent.name}")
-
-# ── Root Agent ─────────────────────────────────────────────────────────────
-if Agent is not None:
-    root_agent = Agent(
-        name="root_agent_reine_des_maracas",
-        model=MODEL_GEMINI_2_0_FLASH,
-        description=(
-            "Agent racine qui route les demandes vers SAV (retours/remboursements/suivi) "
-            "ou Sales (produits/magasins)."
-        ),
-        instruction=(
-            "Tu es le Root Agent de Reine des Maracas. "
-            "1) Détecte l'intention: 'SAV' (retours, remboursement, suivi commande, étiquette de retour) "
-            "ou 'Sales' (recherche produit, tailles, couleurs, prix, magasins/adresses/horaires). "
-            "2) Délègue intégralement à l'agent adéquat (sav_agent, sales_agent). "
-            "3) Ne duplique pas l'information: si un sous-agent répond, synthétise brièvement et conclus par les prochaines étapes."
-        ),
-        sub_agents=[sav_agent, sales_agent],
-        before_model_callback=block_keyword_guardrail,
-        output_key="last_root_answer",
-    )
-
-    print(f"✅ Root Agent created: {root_agent.name}")
-
-# @title 4) Runner (stateful) + quick test convo
-# Si tu as déjà un session_service_stateful (de tes steps précédents), on le réutilise.
-# Sinon, on fait un runner sans service (stateless) pour le test local.
-
-# Resolve session service: reuse if provided globally, else create ADK InMemorySessionService, else go stateless
-session_service_stateful = globals().get("session_service_stateful", None)
-if session_service_stateful is None:
-    try:
-        from google.adk.sessions import InMemorySessionService  # type: ignore
-        session_service_stateful = InMemorySessionService()
-        HAS_STATEFUL = True
-    except Exception:
-        session_service_stateful = None  # type: ignore
-        HAS_STATEFUL = False
-else:
-    HAS_STATEFUL = True
-
-# IDs de session/utilisateur (configurables via env variables)
-USER_ID_STATEFUL = os.getenv("USER_ID_STATEFUL", "gustave")
-SESSION_ID_STATEFUL = os.getenv("SESSION_ID_STATEFUL", "demo-sessions-001")
-
-if Runner is not None and Agent is not None:
-    runner = Runner(
-        agent=root_agent,
-        app_name=APP_NAME,
-        session_service=session_service_stateful if HAS_STATEFUL else None
-    )
-    print(f"✅ Runner ready (stateful={HAS_STATEFUL}).")
-else:
-    runner = None  # type: ignore
-    print("⚠️ Google ADK non disponible: agents/runner non initialisés. Installez google-adk pour les exécuter.")
-
-# Helper async caller (identique à ton pattern)
-import io
-import re
-import contextlib
-from google.genai import types
-
-_code_inline_rx = re.compile(r"`[^`]*`")
-
-def _canon(s: str) -> str:
-    s = _code_inline_rx.sub("", s)
-    s = " ".join(s.split()).strip()
-    return s.lower()
-
-def _collect_best_text(content) -> str:
-    if not getattr(content, "parts", None):
-        return ""
-    texts, seen = [], set()
-    for p in content.parts:
-        t = getattr(p, "text", None)
-        if not t:
-            continue  # ignore function_call & co
-        norm = _canon(t)
-        if norm and norm not in seen:
-            seen.add(norm)
-            texts.append((" ".join(t.split()).strip(), len(norm)))
-    if not texts:
-        return ""
-    texts.sort(key=lambda x: x[1], reverse=True)  # garde le bloc le plus long
-    return texts[0][0]
-
-async def call_agent_async(query: str, runner_obj, user_id: str, session_id: str):
-    print(f"\n[USER] {query}")
-    if runner_obj is None:
-        print("[AGENT] (runner indisponible)")
-        return None
-
-    content = types.Content(role="user", parts=[types.Part(text=query)])
-    resp = None
-
-    # --- coupe TOUT ce que le SDK/ADK pourrait imprimer (warnings, traces, drafts) ---
-    _sink_out, _sink_err = io.StringIO(), io.StringIO()
-    with contextlib.redirect_stdout(_sink_out), contextlib.redirect_stderr(_sink_err):
-        try:
-            # Mode flux d'événements (sans afficher le flux)
-            events = runner_obj.run_async(
-                user_id=user_id,
-                session_id=session_id,
-                new_message=content,
-            )
-            final_event = None
-            async for ev in events:
-                if callable(getattr(ev, "is_final_response", None)) and ev.is_final_response():
-                    final_event = ev
-                    break
-            resp = final_event
-        except TypeError:
-            # Variantes de signature selon versions
-            try:
-                resp = await runner_obj.run_async(
-                    user_id=user_id, session_id=session_id, new_message=content
-                )
-            except TypeError:
-                try:
-                    resp = await runner_obj.run_async(
-                        user_id=user_id, session_id=session_id, input=query
-                    )
-                except TypeError:
-                    resp = await runner_obj.run_async(query)
-    # -------------------------------------------------------------------------------
-
-    final_text = ""
-    if resp and getattr(resp, "content", None):
-        # print(f"[DEBUG] parts: text={sum(1 for p in resp.content.parts if getattr(p,'text',None))} non-text={len(resp.content.parts)-sum(1 for p in resp.content.parts if getattr(p,'text',None))}")
-        final_text = _collect_best_text(resp.content)
-
-    print(f"[AGENT] {final_text or '(pas de texte – réponse outil?)'}")
-    return resp
-
-
-
-# Mini script de test: 1 SAV, 1 blocage, 1 Sales
-async def run_demo():
-    interaction = lambda q: call_agent_async(q, runner, USER_ID_STATEFUL, SESSION_ID_STATEFUL)
-
-    print("\n--- DEMO: Root → SAV ---")
-    await interaction("Je veux retourner un maillot, comment obtenir une étiquette de retour ?")
-
-    print("\n--- DEMO: Guardrail BLOCK ---")
-    await interaction("BLOCK cette requête pour un remboursement immédiat")
-
-    print("\n--- DEMO: Root → Sales ---")
-    await interaction("Je cherche un bikini noir en taille M près de Paris. Une adresse de magasin ?")
-
-    # End of demo
-
-    if HAS_STATEFUL and runner is not None and session_service_stateful is not None:
-        # Optionnel : inspection d'état (compatible avec ADK Session model)
-        sess = await session_service_stateful.get_session(app_name=APP_NAME, user_id=USER_ID_STATEFUL, session_id=SESSION_ID_STATEFUL)  # type: ignore[attr-defined]
-        if sess is not None:
-            print("\n--- Session State Snapshot ---")
-            st = getattr(sess, "state", None)
-            state_map: Dict[str, Any] = {}
-            if isinstance(st, dict):
-                state_map = st
-            elif st is not None:
-                # ADK typically exposes a pydantic SessionState model with `.data` as dict
-                state_map = getattr(st, "data", {}) if isinstance(getattr(st, "data", {}), dict) else {}
-            print("guardrail_block_keyword_triggered:", state_map.get("guardrail_block_keyword_triggered"))
-            print("last_root_answer:", state_map.get("last_root_answer"))
+metadata_agent = LlmAgent(
+    name="metadata_agent", model=MODEL,
+    description="Trouve les tables et colonnes pertinentes pour une question.",
+    instruction="Tu es un expert en schémas de données. Utilise l'outil `find_relevant_schema` pour identifier le contexte de données nécessaire pour répondre à la question de l'utilisateur. Retourne uniquement le résultat de l'outil.",
+    tools=[find_relevant_schema],
+)
+
+sql_agent = LlmAgent(
+    name="sql_agent", model=MODEL,
+    description="Génère et exécute une requête SQL pour répondre à une question, en se basant sur un contexte de schéma.",
+    instruction=(
+        "Tu es un expert SQL pour BigQuery. Ta mission est de répondre à la question de l'utilisateur en générant et exécutant une seule requête.\n"
+        "1. Tu recevras la question, un objet JSON `relevant_tables` et un objet JSON `examples`.\n"
+        "2. **Logique Métier :** Avant d'écrire la requête, vérifie si la question de l'utilisateur correspond à un concept métier (une 'metric' ou une 'dimension'). Si c'est le cas, utilise l'expression SQL fournie dans la description du concept.\n"
+        "3. Inspire-toi des exemples fournis pour la syntaxe correcte.\n"
+        "4. **RÈGLE ABSOLUE :** Ta requête DOIT qualifier chaque nom de table avec `avisia-training.reine_des_maracas.`. Par exemple : `FROM `avisia-training.reine_des_maracas.ticket_caisse` AS t`.\n"
+        "5. Écris une requête SQL `SELECT` qui utilise **uniquement** les tables et colonnes de `relevant_tables`.\n"
+        "6. Finalement, exécute cette requête avec l'outil `run_sql`.\n"
+        "7. Ta réponse finale doit être le résultat de l'outil `run_sql`."
+    ),
+    tools=[rag_sql_examples, run_sql],
+)
+
+
+viz_agent = LlmAgent(
+    name="viz_agent", model=MODEL,
+    description="Crée une spécification de graphique à partir de données JSON.",
+    instruction="Tu recevras des données au format JSON et l'intention de l'utilisateur. Utilise l'outil `chart_spec` pour générer une spécification Vega-Lite. Retourne uniquement le résultat de l'outil.",
+    tools=[chart_spec],
+)
+
+root_agent = LlmAgent(
+    name="root_agent_reine_des_maracas", model=MODEL,
+    description="Orchestre les agents spécialisés pour répondre aux questions analytiques.",
+    instruction=(
+        "Tu es l'orchestrateur principal. Ton but est de répondre à la question de l'utilisateur en coordonnant les agents spécialisés. Voici ton plan d'action :\n"
+        "1. **Étape 1 : Obtenir le Contexte.** Appelle `metadata_agent` avec la question de l'utilisateur pour savoir quelles tables et colonnes sont pertinentes.\n"
+        "2. **Étape 2 : Obtenir les Données.** Prends la question originale de l'utilisateur ET le contexte de schéma de l'étape 1, et passe les deux à `sql_agent` pour qu'il génère et exécute la requête SQL.\n"
+        "3. **Étape 3 : Présenter le Résultat.** La sortie de `sql_agent` est la réponse finale. Présente-la clairement à l'utilisateur.\n"
+        "4. **Gestion de l'ambiguïté (si nécessaire) :** Si, à n'importe quelle étape, un agent retourne une erreur ou si la question semble vraiment trop vague, tu peux appeler `ux_agent` pour demander une clarification.\n"
+        "5. **Visualisation (Optionnel) :** Si la question initiale demande un 'graphique' ou une 'visualisation' et que tu as obtenu des données de `sql_agent`, passe ces données et la question à `viz_agent`."
+    ),
+    sub_agents=[ux_agent, metadata_agent, sql_agent, viz_agent],
+)
+
+# --- Initialisation au démarrage ---
+_initialize_components()

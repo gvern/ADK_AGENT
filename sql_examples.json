@@ -1,0 +1,73 @@
+[
+  {
+    "question": "CA par ville sur les 30 derniers jours",
+    "sql": "SELECT m.VILLE, SUM(tc.QUANTITE * tc.PRIX_AP_REMISE) AS CA\nFROM `.`avisia-training.reine_des_maracas.ticket_caisse`` tc\nJOIN `.magasin` m ON m.CODE_BOUTIQUE = tc.CODE_BOUTIQUE\nWHERE (tc.ANNULATION IS FALSE OR tc.ANNULATION IS NULL)\n  AND SAFE.PARSE_DATE('%d/%m/%Y', tc.DATE_TICKET) >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)\nGROUP BY m.VILLE\nORDER BY CA DESC",
+    "notes": "Filtre période + exclusion annulations"
+  },
+  {
+    "question": "Nombre de tickets et CA total hier",
+    "sql": "SELECT COUNT(DISTINCT NUM_TICKET) AS nb_tickets, SUM(QUANTITE * PRIX_AP_REMISE) AS ca_total\nFROM `.`avisia-training.reine_des_maracas.ticket_caisse``\nWHERE (ANNULATION IS FALSE OR ANNULATION IS NULL)\n  AND SAFE.PARSE_DATE('%d/%m/%Y', DATE_TICKET) = DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)",
+    "notes": "Usage DATE_SUB pour 'hier'"
+  },
+  {
+    "question": "Top 10 familles par CA sur 90 jours",
+    "sql": "SELECT tp.FAMILLE, SUM(tc.QUANTITE * tc.PRIX_AP_REMISE) AS CA\nFROM `.`avisia-training.reine_des_maracas.ticket_caisse`` tc\nJOIN `.referentiel` r ON r.EAN = tc.EAN\nJOIN `.typo_produit` tp ON tp.ID_MODELE = r.ID_MODELE\nWHERE (tc.ANNULATION IS FALSE OR tc.ANNULATION IS NULL)\n  AND SAFE.PARSE_DATE('%d/%m/%Y', tc.DATE_TICKET) >= DATE_SUB(CURRENT_DATE(), INTERVAL 90 DAY)\nGROUP BY tp.FAMILLE\nORDER BY CA DESC\nLIMIT 10",
+    "notes": "Jointure produit pour familles"
+  },
+  {
+    "question": "Répartition des clients par SEGACT",
+    "sql": "SELECT SEGACT, COUNT(DISTINCT ID_INDIVIDU) AS nb_clients\nFROM `.complement_individu`\nGROUP BY SEGACT\nORDER BY nb_clients DESC",
+    "notes": "Segmentation activité"
+  },
+  {
+    "question": "CA et tickets annulés vs valides sur 30 jours",
+    "sql": "SELECT CASE WHEN ANNULATION IS TRUE THEN 'annule' ELSE 'valide' END AS statut,\n       COUNT(DISTINCT NUM_TICKET) AS nb_tickets,\n       SUM(QUANTITE * PRIX_AP_REMISE) AS ca\nFROM `.`avisia-training.reine_des_maracas.ticket_caisse``\nWHERE SAFE.PARSE_DATE('%d/%m/%Y', DATE_TICKET) >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)\nGROUP BY statut\nORDER BY statut",
+    "notes": "Comparaison annulations"
+  },
+  {
+    "question": "Annulations immédiates par famille (30 jours)",
+    "sql": "SELECT tp.FAMILLE, COUNT(DISTINCT tc.NUM_TICKET) AS nb_annulations\nFROM `.`avisia-training.reine_des_maracas.ticket_caisse`` tc\nJOIN `.referentiel` r ON r.EAN = tc.EAN\nJOIN `.typo_produit` tp ON tp.ID_MODELE = r.ID_MODELE\nWHERE tc.ANNULATION_IMMEDIATE IS TRUE\n  AND SAFE.PARSE_DATE('%d/%m/%Y', tc.DATE_TICKET) >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)\nGROUP BY tp.FAMILLE\nORDER BY nb_annulations DESC",
+    "notes": "Usage flag ANNULATION_IMMEDIATE"
+  },
+  {
+    "question": "CA par segment client sur 60 jours",
+    "sql": "SELECT ci.SEGACT, SUM(tc.QUANTITE * tc.PRIX_AP_REMISE) AS CA\nFROM `.`avisia-training.reine_des_maracas.ticket_caisse`` tc\nJOIN `.complement_individu` ci ON ci.ID_INDIVIDU = tc.ID_INDIVIDU\nWHERE (tc.ANNULATION IS FALSE OR tc.ANNULATION IS NULL)\n  AND SAFE.PARSE_DATE('%d/%m/%Y', tc.DATE_TICKET) >= DATE_SUB(CURRENT_DATE(), INTERVAL 60 DAY)\nGROUP BY ci.SEGACT\nORDER BY CA DESC",
+    "notes": "Jointure tickets ↔ segment"
+  },
+  {
+    "question": "Evolution quotidienne CA 14 jours",
+    "sql": "SELECT SAFE.PARSE_DATE('%d/%m/%Y', DATE_TICKET) AS jour,\n       SUM(QUANTITE * PRIX_AP_REMISE) AS CA\nFROM `.`avisia-training.reine_des_maracas.ticket_caisse``\nWHERE (ANNULATION IS FALSE OR ANNULATION IS NULL)\n  AND SAFE.PARSE_DATE('%d/%m/%Y', DATE_TICKET) >= DATE_SUB(CURRENT_DATE(), INTERVAL 14 DAY)\nGROUP BY jour\nORDER BY jour",
+    "notes": "Série temporelle simple"
+  },
+  {
+    "question": "Top 5 magasins par CA sur 30 jours",
+    "sql": "SELECT m.VILLE, m.CODE_BOUTIQUE, SUM(tc.QUANTITE * tc.PRIX_AP_REMISE) AS CA\nFROM `.`avisia-training.reine_des_maracas.ticket_caisse`` tc\nJOIN `.magasin` m ON m.CODE_BOUTIQUE = tc.CODE_BOUTIQUE\nWHERE (tc.ANNULATION IS FALSE OR tc.ANNULATION IS NULL)\n  AND SAFE.PARSE_DATE('%d/%m/%Y', tc.DATE_TICKET) >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)\nGROUP BY m.VILLE, m.CODE_BOUTIQUE\nORDER BY CA DESC\nLIMIT 5",
+    "notes": "Magasins performants"
+  },
+  {
+    "question": "Taux d'annulation immédiate (30 jours)",
+    "sql": "WITH base AS (\n  SELECT COUNT(DISTINCT NUM_TICKET) AS total_tickets\n  FROM `.`avisia-training.reine_des_maracas.ticket_caisse``\n  WHERE SAFE.PARSE_DATE('%d/%m/%Y', DATE_TICKET) >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)\n), ann AS (\n  SELECT COUNT(DISTINCT NUM_TICKET) AS annules\n  FROM `.`avisia-training.reine_des_maracas.ticket_caisse``\n  WHERE ANNULATION_IMMEDIATE IS TRUE\n    AND SAFE.PARSE_DATE('%d/%m/%Y', DATE_TICKET) >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)\n)\nSELECT ann.annules, base.total_tickets, SAFE_DIVIDE(ann.annules, base.total_tickets) AS taux_annulation_immediate\nFROM ann CROSS JOIN base",
+    "notes": "Ratio annulations immédiates"
+  },
+
+  {
+    "question": "Quel est le chiffre d'affaires total pour l'année 2020 ?",
+    "query": "SELECT SUM(t.PRIX_AP_REMISE * t.QUANTITE) AS total_revenue FROM `avisia-training.reine_des_maracas.ticket_caisse` AS t WHERE SAFE.PARSE_DATE('%d/%m/%Y', t.DATE_TICKET) BETWEEN '2020-01-01' AND '2020-12-31'"
+  },
+  {
+    "question": "Quelles sont les 5 familles de produits les plus vendues en quantité ?",
+    "query": "SELECT p.FAMILLE, SUM(t.QUANTITE) AS total_quantity FROM `avisia-training.reine_des_maracas.ticket_caisse` AS t LEFT JOIN referentiel AS r ON t.CODE_LIGNE = r.ID_ARTICLE LEFT JOIN typo_produit AS p ON r.ID_MODELE = p.ID_MODELE GROUP BY p.FAMILLE ORDER BY total_quantity DESC LIMIT 5"
+  },
+  {
+    "question": "Montre-moi le chiffre d'affaires par ville.",
+    "query": "SELECT m.VILLE, SUM(t.PRIX_AP_REMISE * t.QUANTITE) AS total_revenue FROM `avisia-training.reine_des_maracas.ticket_caisse` AS t LEFT JOIN magasin AS m ON t.CODE_BOUTIQUE = m.CODE_BOUTIQUE GROUP BY m.VILLE ORDER BY total_revenue DESC"
+  },
+  {
+    "question": "Quel ticket de caisse a la plus grande quantité d'articles ?",
+    "query": "SELECT NUM_TICKET, SUM(QUANTITE) as total_items FROM `avisia-training.reine_des_maracas.ticket_caisse` GROUP BY NUM_TICKET ORDER BY total_items DESC LIMIT 1"
+  },
+  {
+    "question": "Quel est le total des ventes pour l'année 2021 ?",
+    "query": "SELECT SUM(PRIX_AP_REMISE * QUANTITE) FROM `avisia-training.reine_des_maracas.ticket_caisse` WHERE EXTRACT(YEAR FROM SAFE.PARSE_DATE('%d/%m/%Y', DATE_TICKET)) = 2021"
+  }
+]
