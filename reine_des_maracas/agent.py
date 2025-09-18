@@ -21,8 +21,6 @@ import numpy as np
 from google.cloud import bigquery
 from google.api_core.exceptions import GoogleAPICallError
 from google.adk.agents.llm_agent import LlmAgent
-import vertexai
-from vertexai.language_models import TextEmbeddingModel
 
 # --- Vérification et importation des dépendances ---
 try:
@@ -33,11 +31,11 @@ except ImportError:
     VERTEXAI_AVAILABLE = False
 
 # --- Configuration ---
-MODEL = os.getenv("DATA_MODEL", "gemini-1.5-flash-002")
+MODEL = os.getenv("DATA_MODEL", "gemini-2.5-flash")
 if os.getenv("VERTEX_PROJECT") and not os.getenv("VERTEXAI_PROJECT"):
     os.environ["VERTEXAI_PROJECT"] = os.environ["VERTEX_PROJECT"]
 if os.getenv("VERTEX_LOCATION") and not os.getenv("VERTEXAI_LOCATION"):
-    os.environ["VERTEXAI_LOCATION"] = os.environ["VERTEXAI_LOCATION"]
+    os.environ["VERTEXAI_LOCATION"] = os.environ["VERTEX_LOCATION"]
 PROJECT = os.getenv("VERTEXAI_PROJECT", "avisia-training")
 LOCATION = os.getenv("VERTEXAI_LOCATION", "europe-west1")
 DATASET = os.getenv("VERTEX_BQ_DATASET", "reine_des_maracas")
@@ -142,7 +140,12 @@ class SemanticIndex:
         return SemanticIndex(metadata, vectors, client)
     def search(self, query: str, top_k: int = 10) -> List[Dict[str, Any]]:
         query_vec = self.client.get_embeddings([query])
-        query_norm = query_vec / np.linalg.norm(query_vec)
+        if query_vec.size == 0 or not np.any(query_vec):
+            return []
+        qnorm = np.linalg.norm(query_vec)
+        if qnorm == 0:
+            return []
+        query_norm = query_vec / qnorm
         sims = np.dot(self.normalized_vectors, query_norm.T).flatten()
         indices = np.argpartition(sims, -top_k)[-top_k:]
         sorted_indices = indices[np.argsort(-sims[indices])]
@@ -158,25 +161,113 @@ def _initialize_components():
 
 # --- Outils pour les Agents ---
 def find_relevant_schema(question: str) -> Dict[str, Any]:
-    """Trouve les tables et colonnes les plus pertinentes pour une question."""
-    if not _SEMANTIC_INDEX: return {"error": "L'index sémantique n'est pas initialisé."}
-    
-    search_results = _SEMANTIC_INDEX.search(question, top_k=15)
-    
+    """
+    Retourne:
+      - relevant_tables: {table: [colonnes pertinentes]}
+      - schema_details:  tables -> champs (name, type, mode, description, allowed_values, format), joins filtrés
+      - business_concepts: metrics/dimensions depuis table_description.json
+    """
+    if not _SEMANTIC_INDEX:
+        return {"error": "L'index sémantique n'est pas initialisé."}
+
+    # 1) Recherche sémantique
+    search_results = _SEMANTIC_INDEX.search(question, top_k=20)
+
     table_context = defaultdict(list)
     for res in search_results:
-        if res['score'] > 0.6: # Augmenter le seuil de pertinence
-            table_context[res['table']].append(res['field'])
-            
-    # Retourner un objet JSON propre, pas une chaîne formatée
-    return {"relevant_tables": dict(table_context)}
+        if res["score"] > 0.45:
+            table_context[res["table"]].append(res["field"])
+
+    # 2) Safety nets (ventes/ville)
+    ql = question.lower()
+    if ("ticket_caisse" in table_context) or any(k in ql for k in ["vente", "ventes", "ca", "chiffre d'affaires"]):
+        must_tc = ["DATE_TICKET", "PRIX_AP_REMISE", "QUANTITE", "CODE_BOUTIQUE", "ANNULATION", "ANNULATION_IMMEDIATE"]
+        table_context["ticket_caisse"] = sorted(set(table_context["ticket_caisse"] + must_tc))
+    if any(city in ql for city in ["paris", "lyon", "marseille", "toulouse", "lille"]):
+        must_m = ["VILLE", "CODE_BOUTIQUE"]
+        table_context["magasin"] = sorted(set(table_context["magasin"] + must_m))
+
+    # Fallback si vide
+    if not table_context:
+        table_context = {
+            "ticket_caisse": ["DATE_TICKET", "PRIX_AP_REMISE", "QUANTITE", "CODE_BOUTIQUE", "ANNULATION", "ANNULATION_IMMEDIATE"],
+            "magasin": ["VILLE", "CODE_BOUTIQUE"],
+        }
+
+    # 3) Enrichissement: types, descriptions, allowed_values, format
+    enriched = get_enriched_schema()          # merge live + statique
+    static_desc = _load_static_descriptions() # brut du JSON (pour joins/concepts)
+
+    # index rapides
+    tbl_map = {t["name"]: t for t in enriched.get("tables", [])}
+    static_tbl_map = {t["name"]: t for t in static_desc.get("tables", [])}
+
+    schema_details = {"tables": {}}
+
+    # ne garder que les tables pertinentes
+    kept_tables = set(table_context.keys())
+
+    for tname in kept_tables:
+        t_live = tbl_map.get(tname, {"fields": []})
+        t_static = static_tbl_map.get(tname, {"fields": []})
+        # map pour retrouver allowed_values/format du JSON statique
+        stat_fields = {f["name"]: f for f in t_static.get("fields", [])}
+
+        fields_out = []
+        for f in t_live.get("fields", []):
+            fname = f.get("name")
+            if fname in set(table_context[tname]):  # ne sortir que les colonnes pertinentes
+                stat = stat_fields.get(fname, {})
+                fields_out.append({
+                    "name": fname,
+                    "type": f.get("type"),
+                    "mode": f.get("mode"),
+                    "description": f.get("description") or stat.get("description"),
+                    "allowed_values": stat.get("allowed_values"),
+                    "format": stat.get("format"),
+                    "key": stat.get("key"),
+                })
+
+        pk = [ff["name"] for ff in t_static.get("fields", []) if str(ff.get("key","")).startswith("PRIMARY_KEY")]
+        fk = [ff["name"] for ff in t_static.get("fields", []) if "FOREIGN_KEY" in str(ff.get("key",""))]
+        schema_details["tables"][tname] = {
+            "description": t_live.get("description"),
+            "fields": fields_out,
+            "joins": [],
+            "keys": {"primary": pk, "foreign": fk},
+        }
+
+    # 4) Relations (joins) filtrées aux tables retenues
+    joins = static_desc.get("relations", [])
+    filtered_joins = []
+    for j in joins:
+        left_tbl = j.get("left", "").split(".")[0]
+        right_tbl = j.get("right", "").split(".")[0]
+        if left_tbl in kept_tables or right_tbl in kept_tables:
+            filtered_joins.append(j)
+    # distribuer par table
+    for j in filtered_joins:
+        for side in ["left", "right"]:
+            t_side = j.get(side, "").split(".")[0]
+            if t_side in schema_details["tables"]:
+                schema_details["tables"][t_side]["joins"].append(j)
+
+    # 5) Règles métier (concepts)
+    business_concepts = static_desc.get("concepts", {})
+
+    return {
+        "relevant_tables": dict(table_context),
+        "schema_details": schema_details,
+        "business_concepts": business_concepts,
+    }
+
 
 def rag_sql_examples(question: str) -> Dict[str, Any]:
     """Récupère des exemples de questions-SQL similaires à la question de l'utilisateur."""
     if not _SEMANTIC_INDEX: return {"examples": "L'index sémantique n'est pas initialisé."}
     
     examples = _load_sql_examples()
-    if not examples: return {"examples": "Aucun exemple SQL disponible."}
+    if not examples: return {"examples": []}
     
     example_questions = [ex['question'] for ex in examples]
     all_texts = [question] + example_questions
@@ -194,32 +285,59 @@ def rag_sql_examples(question: str) -> Dict[str, Any]:
     return {"examples": top_examples}
 
 def run_sql(query: str) -> Dict[str, Any]:
-    """Exécute une requête SQL SELECT-only sur BigQuery."""
+    """Exécute une requête SQL SELECT-only sur BigQuery en qualifiant intelligemment les tables."""
     if not query: return {"error": "Requête vide reçue."}
     
-    # Nettoyage simple des ```sql
+    # Nettoyage initial
     if match := re.compile(r"^\s*```(?:sql)?\s*([\s\S]*?)\s*```\s*$", re.IGNORECASE).match(query): query = match.group(1)
     final_query = query.strip()
 
     if not re.compile(r"^\s*SELECT\b", re.IGNORECASE).search(final_query):
         return {"error": "Seules les requêtes SELECT sont autorisées."}
 
+    # Remplacement intelligent : n'ajoute le préfixe que si la table n'est pas déjà qualifiée.
+    def qualify_table_names(q: str) -> str:
+        # FROM/JOIN <name>   où <name> ∈ {table | dataset.table | project.dataset.table}
+        # et pas un appel de fonction (pas de '(' juste après le token)
+        pattern = r"\b(FROM|JOIN)\s+`?([A-Za-z_]\w*(?:\.[A-Za-z_]\w*){0,2})`?(?!\s*\()"
+        def repl(m):
+            kw = m.group(1)
+            full = m.group(2).strip("`")
+            parts = full.split(".")
+            if len(parts) == 3:
+                # déjà project.dataset.table → inchangé
+                return f"{kw} `{full}`"
+            if len(parts) == 2:
+                ds, tbl = parts
+                return f"{kw} `{PROJECT}.{ds}.{tbl}`"
+            # len==1
+            return f"{kw} `{PROJECT}.{DATASET}.{parts[0]}`"
+        return re.sub(pattern, repl, q, flags=re.IGNORECASE)
+
+
+    # Appliquer la qualification uniquement si l'agent a "oublié" le nom complet
+    # On vérifie la présence du nom du projet dans la requête pour décider.
+
+    final_query = qualify_table_names(final_query)
+    
     client = _bq_client()
     if not client: return {"error": "Client BigQuery non disponible."}
     
     try:
         job = client.query(final_query)
-        rows = list(job.result(max_results=1000))
+        rows_iter = job.result(max_results=1000)
+        
+        cols = [sf.name for sf in rows_iter.schema]
+        rows = [list(row.values()) for row in rows_iter]
+
         if not rows: return {"result": "La requête a fonctionné mais n'a retourné aucune ligne."}
         
-        cols = [sf.name for sf in job.schema]
         data = [{col: row[i] for i, col in enumerate(cols)} for row in rows]
         return {"result": json.dumps(data, indent=2, default=str)}
+
     except Exception as e:
         logging.error(f"Échec du job SQL : {e} sur la requête : {final_query}")
         return {"error": f"Erreur lors de l'exécution de la requête : {str(e)}"}
-
-
 def chart_spec(data_json: str, user_intent: str) -> Dict[str, Any]:
     """Génère une spécification Vega-Lite basique."""
     try:
@@ -256,52 +374,100 @@ def chart_spec(data_json: str, user_intent: str) -> Dict[str, Any]:
     }
     return {"vega_lite_spec": json.dumps(spec, indent=2)}
 
+# --- Correctif pour l'Automatic Function Calling (AFC) ---
+# Matérialise les annotations de chaînes en types réels pour éviter les erreurs AFC
+from typing import get_type_hints
+
+def _materialize_annotations(func):
+    try:
+        func.__annotations__ = get_type_hints(func)
+    except Exception:
+        pass
+    return func
+
+# Matérialiser les annotations des fonctions exposées comme tools
+_materialize_annotations(find_relevant_schema)
+_materialize_annotations(rag_sql_examples)
+_materialize_annotations(run_sql)
+_materialize_annotations(chart_spec)
+
 # --- Définitions des Agents ---
 
 ux_agent = LlmAgent(
-    name="ux_agent", model=MODEL,
+    name="ux_agent",
+    model=MODEL,
     description="Clarifie les questions vagues des utilisateurs.",
-    instruction="Ta tâche est de reformuler la question de l'utilisateur ou de poser une question de clarification si elle est trop vague. Sois concis. Ne réponds qu'avec la clarification.",
+    instruction=(
+        "Ta tâche est de reformuler la question de l'utilisateur ou de poser une question de clarification si elle est trop vague. "
+        "Sois concis. Ne réponds qu'avec la clarification."
+    ),
 )
 
 metadata_agent = LlmAgent(
-    name="metadata_agent", model=MODEL,
+    name="metadata_agent",
+    model=MODEL,
     description="Trouve les tables et colonnes pertinentes pour une question.",
-    instruction="Tu es un expert en schémas de données. Utilise l'outil `find_relevant_schema` pour identifier le contexte de données nécessaire pour répondre à la question de l'utilisateur. Retourne uniquement le résultat de l'outil.",
+    instruction=(
+
+        "Utilise STRICTEMENT l’outil `find_relevant_schema(question=<question>)`.\n"
+        "Après la réponse de l’outil, renvoie EXACTEMENT l’objet JSON retourné, sans autre texte."
+    ),
     tools=[find_relevant_schema],
 )
+
 
 sql_agent = LlmAgent(
     name="sql_agent", model=MODEL,
     description="Génère et exécute une requête SQL pour répondre à une question, en se basant sur un contexte de schéma.",
     instruction=(
-        "Tu es un expert SQL pour BigQuery. Ta mission est de répondre à la question de l'utilisateur en générant et exécutant une seule requête.\n"
-        "1. Tu recevras la question, un objet JSON `relevant_tables` et un objet JSON `examples`.\n"
-        "2. **Logique Métier :** Avant d'écrire la requête, vérifie si la question de l'utilisateur correspond à un concept métier (une 'metric' ou une 'dimension'). Si c'est le cas, utilise l'expression SQL fournie dans la description du concept.\n"
-        "3. Inspire-toi des exemples fournis pour la syntaxe correcte.\n"
-        "4. **RÈGLE ABSOLUE :** Ta requête DOIT qualifier chaque nom de table avec `avisia-training.reine_des_maracas.`. Par exemple : `FROM `avisia-training.reine_des_maracas.ticket_caisse` AS t`.\n"
-        "5. Écris une requête SQL `SELECT` qui utilise **uniquement** les tables et colonnes de `relevant_tables`.\n"
-        "6. Finalement, exécute cette requête avec l'outil `run_sql`.\n"
-        "7. Ta réponse finale doit être le résultat de l'outil `run_sql`."
+        "Tu es un expert SQL BigQuery.\n"
+        "Tu recevras :\n"
+        "- `question`\n"
+        "- `find_relevant_schema_response` (avec `relevant_tables`, `schema_details`=tables/fields/joins et `business_concepts`)\n"
+        "- `examples`\n"
+        "**RÈGLE ABSOLUE :** Ta requête DOIT qualifier chaque nom de table avec `avisia-training.reine_des_maracas.`. Par exemple : `FROM `avisia-training.reine_des_maracas.ticket_caisse` AS t`.\n"
+        "Règles strictes :\n"
+        "• Utilise les *relations* de `schema_details` pour choisir les JOINs et les clés.\n"
+        "• N’emploie que les colonnes présentes dans `schema_details.tables[*].fields`.\n"
+        "• Si la question correspond à un concept métier, utilise `business_concepts.metrics/dimensions` (expression SQL).\n"
+        "• `DATE_TICKET` est STRING au format DD/MM/YYYY → `SAFE.PARSE_DATE('%d/%m/%Y', t.DATE_TICKET)` pour tout EXTRACT/filtre.\n"
+        "• `ANNULATION` et `ANNULATION_IMMEDIATE` sont BOOL → filtre avec `NOT t.ANNULATION AND NOT t.ANNULATION_IMMEDIATE`.\n"
+        "• Pour filtrer les villes, fais une comparaison insensible à la casse :UPPER(m.VILLE) = UPPER('<valeur utilisateur>').\n"
+        "• Toutes les tables doivent être **entièrement qualifiées** `avisia-training.reine_des_maracas.*`.\n"
+        "• Mesure principale alias `ca` et enveloppée par `COALESCE(...,0)`.\n"
+        "Ensuite, exécute via `run_sql` et renvoie son résultat."
     ),
     tools=[rag_sql_examples, run_sql],
 )
 
 
 viz_agent = LlmAgent(
-    name="viz_agent", model=MODEL,
+    name="viz_agent",
+    model=MODEL,
     description="Crée une spécification de graphique à partir de données JSON.",
-    instruction="Tu recevras des données au format JSON et l'intention de l'utilisateur. Utilise l'outil `chart_spec` pour générer une spécification Vega-Lite. Retourne uniquement le résultat de l'outil.",
+    instruction=(
+        "Tu recevras des données au format JSON et l'intention de l'utilisateur. "
+        "Utilise l'outil `chart_spec` pour générer une spécification Vega-Lite."
+    ),
     tools=[chart_spec],
 )
 
 root_agent = LlmAgent(
     name="root_agent_reine_des_maracas", model=MODEL,
-    description="Orchestre les agents spécialisés pour répondre aux questions analytiques.",
+    description=(
+        "Orchestre les agents spécialisés pour répondre aux questions analytiques. "
+        "Après `metadata_agent`, transfert obligatoire vers `sql_agent` via `transfer_to_agent` avec la question, la réponse de schéma et la consigne."
+    ),
     instruction=(
         "Tu es l'orchestrateur principal. Ton but est de répondre à la question de l'utilisateur en coordonnant les agents spécialisés. Voici ton plan d'action :\n"
         "1. **Étape 1 : Obtenir le Contexte.** Appelle `metadata_agent` avec la question de l'utilisateur pour savoir quelles tables et colonnes sont pertinentes.\n"
-        "2. **Étape 2 : Obtenir les Données.** Prends la question originale de l'utilisateur ET le contexte de schéma de l'étape 1, et passe les deux à `sql_agent` pour qu'il génère et exécute la requête SQL.\n"
+        "2. **Étape 2 : Obtenir les Données.** Après avoir reçu la réponse JSON de `metadata_agent`, tu DOIS immédiatement appeler `transfer_to_agent` vers `sql_agent` en lui envoyant un message EXACTEMENT structuré ainsi :\n"
+        "   - question: \"<question originale>\"\n"
+        "   - find_relevant_schema_response: <le JSON retourné par metadata_agent, inchangé>\n"
+        "   - consigne: \"Génère une seule requête SELECT BigQuery, entièrement qualifiée avisia-training.reine_des_maracas.*, puis exécute-la via run_sql.\"\n"
+        "   Ne modifie pas le JSON de schéma.\n"
+        "   Important : Si tu as appelé `metadata_agent`, ne réponds JAMAIS directement à l'utilisateur tant que `sql_agent` n’a pas renvoyé le résultat.\n"
+        "   Une fois le transfert effectué, attends la sortie de `sql_agent`.\n"
         "3. **Étape 3 : Présenter le Résultat.** La sortie de `sql_agent` est la réponse finale. Présente-la clairement à l'utilisateur.\n"
         "4. **Gestion de l'ambiguïté (si nécessaire) :** Si, à n'importe quelle étape, un agent retourne une erreur ou si la question semble vraiment trop vague, tu peux appeler `ux_agent` pour demander une clarification.\n"
         "5. **Visualisation (Optionnel) :** Si la question initiale demande un 'graphique' ou une 'visualisation' et que tu as obtenu des données de `sql_agent`, passe ces données et la question à `viz_agent`."
