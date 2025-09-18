@@ -174,3 +174,14 @@ adk web apps
 ---
 
 **You’re set.** Next time: export the env block, start MCP (or point to Cloud Run), and use either the CLI or `adk web apps`.
+
+
+find . -name "__pycache__" -type d -exec rm -rf {} +              
+export VERTEXAI_PROJECT="avisia-training"                                           
+export VERTEXAI_LOCATION="europe-west1"
+export VERTEX_BQ_DATASET="reine_des_maracas"
+export SQL_SCHEMA_PATH="./table_description.json"
+gcloud auth application-default login -q
+gcloud auth application-default set-quota-project avisia-training -q
+export PYTHONPATH="$PWD"
+adk web apps
