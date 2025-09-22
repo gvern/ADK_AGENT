@@ -8,6 +8,8 @@ orchestrator routes tasks to specialized sub-agents (UX, Metadata, SQL, Viz).
 from __future__ import annotations
 
 import os
+from pathlib import Path
+from importlib import resources
 import re
 import json
 import logging
@@ -39,8 +41,15 @@ if os.getenv("VERTEX_LOCATION") and not os.getenv("VERTEXAI_LOCATION"):
 PROJECT = os.getenv("VERTEXAI_PROJECT", "avisia-training")
 LOCATION = os.getenv("VERTEXAI_LOCATION", "europe-west1")
 DATASET = os.getenv("VERTEX_BQ_DATASET", "reine_des_maracas")
-DESCRIPTION_PATH = os.getenv("SQL_SCHEMA_PATH", "./table_description.json")
-EXAMPLES_PATH = os.getenv("SQL_EXAMPLES_PATH", "./sql_examples.json")
+BASE_DIR = os.path.dirname(__file__)
+DESCRIPTION_PATH = os.getenv(
+    "SQL_SCHEMA_PATH",
+    os.path.join(BASE_DIR, "table_description.json")
+)
+EXAMPLES_PATH = os.getenv(
+    "SQL_EXAMPLES_PATH",
+    os.path.join(BASE_DIR, "sql_examples.json")
+)
 
 if VERTEXAI_AVAILABLE:
     try:
@@ -71,7 +80,13 @@ def get_enriched_schema() -> Dict[str, Any]:
     if client and DATASET:
         try:
             query = f"SELECT table_name, column_name, data_type FROM `{PROJECT}.{DATASET}.INFORMATION_SCHEMA.COLUMNS` ORDER BY table_name, ordinal_position;"
-            rows = client.query(query).result()
+            job = client.query(
+                query,
+                location=os.getenv("BQ_LOCATION"),
+                job_config=bigquery.QueryJobConfig()   
+            )
+            # TIMEOUT DUR ET COURT (ex. 8s)
+            rows = job.result(timeout=8)
             tables_temp: Dict[str, Dict[str, Any]] = defaultdict(lambda: {"fields": []})
             for row in rows:
                 tables_temp[row.table_name]["name"] = row.table_name
@@ -88,12 +103,36 @@ def get_enriched_schema() -> Dict[str, Any]:
     return live_schema
 
 def _load_static_descriptions() -> Dict[str, Any]:
+    """
+    Recherche dans l'ordre :
+      1) Chemin explicite via $SQL_SCHEMA_PATH
+      2) Fichier embarqué dans le package `reine_des_maracas/table_description.json`
+      3) Fichier à la racine de l'app (./table_description.json)
+    """
+    candidates: List[Path] = []
+    # 1) ENV
+    if DESCRIPTION_PATH:
+        candidates.append(Path(DESCRIPTION_PATH))
+    # 2) Package resource
     try:
-        if os.path.exists(DESCRIPTION_PATH):
-            with open(DESCRIPTION_PATH, "r", encoding="utf-8") as f: return json.load(f)
-    except (IOError, json.JSONDecodeError) as e:
-        logging.warning(f"Impossible de charger le fichier de description du schéma : {e}")
-    return {"tables": []}
+        pkg_file = resources.files(__package__).joinpath("table_description.json")  # type: ignore[arg-type]
+        candidates.append(Path(str(pkg_file)))
+    except Exception:
+        pass
+    # 3) Repo root fallback
+    candidates.append(Path(__file__).resolve().parent.parent / "table_description.json")
+
+    for p in candidates:
+        try:
+            if p.exists():
+                with open(p, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                logging.info(f"Chargé table_description.json depuis: {p}")
+                return data
+        except (IOError, json.JSONDecodeError) as e:
+            logging.warning(f"Échec lecture {p}: {e}")
+    logging.warning("Aucune description statique trouvée. Joins/concepts indisponibles.")
+    return {"tables": [], "relations": [], "concepts": {}}
 
 @lru_cache(maxsize=1)
 def _load_sql_examples() -> List[Dict[str, Any]]:
@@ -159,6 +198,34 @@ def _initialize_components():
         schema = get_enriched_schema()
         _SEMANTIC_INDEX = SemanticIndex.create(schema, client)
 
+# --- Sanitize SQL Functions ---
+def _sanitize_functions(q: str) -> str:
+    """
+    Nettoie les dérives de génération liées aux fonctions BigQuery :
+      - PARSE_DAT`E  → PARSE_DATE
+      - <project>.SAFE.PARSE_DATE → SAFE.PARSE_DATE (on retire toute qualification projet/dataset)
+      - Backticks résiduels autour des fonctions (ex: `EXTRACT`(...) → EXTRACT(...))
+    """
+    # 1) Répare PARSE_DAT`E
+    q = re.sub(r"PARSE_DAT`?E", "PARSE_DATE", q, flags=re.IGNORECASE)
+
+    # 2) Retire une qualification projet.* (avec ou sans backticks) placée devant des fonctions connues
+    funcs = [
+        r"SAFE\.PARSE_DATE", r"SAFE\.PARSE_DATETIME", r"SAFE\.PARSE_TIME",
+        r"SAFE\.CAST", r"EXTRACT", r"DATE", r"DATETIME", r"TIMESTAMP",
+    ]
+    proj = re.escape(PROJECT)
+    # patterns possibles (ordre important : le plus spécifique d'abord)
+    # - `project.func`  → func
+    # - project.func    → func
+    for f in funcs:
+        q = re.sub(rf"`?{proj}\.\`?({f})`?", r"\1", q, flags=re.IGNORECASE)
+
+    # 3) Backticks orphelins sur les noms de fonctions
+    q = re.sub(r"`(EXTRACT|DATE|DATETIME|TIMESTAMP|SAFE)`\s*\(", r"\1(", q, flags=re.IGNORECASE)
+
+    return q
+
 # --- Outils pour les Agents ---
 def find_relevant_schema(question: str) -> Dict[str, Any]:
     """
@@ -180,7 +247,13 @@ def find_relevant_schema(question: str) -> Dict[str, Any]:
 
     # 2) Safety nets (ventes/ville)
     ql = question.lower()
-    if ("ticket_caisse" in table_context) or any(k in ql for k in ["vente", "ventes", "ca", "chiffre d'affaires"]):
+    # élargit le déclencheur "ventes" pour couvrir "vendu", "best sellers", etc.
+    ventes_trigs = [
+        "vente", "ventes", "vendu", "vendus",
+        "meilleures ventes", "meilleurs ventes", "best sellers", "top ventes",
+        "chiffre d'affaires", "ca"
+    ]
+    if ("ticket_caisse" in table_context) or any(k in ql for k in ventes_trigs):
         must_tc = ["DATE_TICKET", "PRIX_AP_REMISE", "QUANTITE", "CODE_BOUTIQUE", "ANNULATION", "ANNULATION_IMMEDIATE"]
         table_context["ticket_caisse"] = sorted(set(table_context["ticket_caisse"] + must_tc))
     if any(city in ql for city in ["paris", "lyon", "marseille", "toulouse", "lille"]):
@@ -297,34 +370,68 @@ def run_sql(query: str) -> Dict[str, Any]:
 
     # Remplacement intelligent : n'ajoute le préfixe que si la table n'est pas déjà qualifiée.
     def qualify_table_names(q: str) -> str:
-        # FROM/JOIN <name>   où <name> ∈ {table | dataset.table | project.dataset.table}
-        # et pas un appel de fonction (pas de '(' juste après le token)
-        pattern = r"\b(FROM|JOIN)\s+`?([A-Za-z_]\w*(?:\.[A-Za-z_]\w*){0,2})`?(?!\s*\()"
+        """
+        Qualifie uniquement les identifiants de table après FROM/JOIN.
+        Cas gérés :
+          - table
+          - dataset.table
+          - project-with-dash.dataset.table
+          - déjà backtické : `project.dataset.table`
+        Ne touche pas aux fonctions ni sous-requêtes.
+        """
+        # Capture :
+        # 1) `...` (déjà backtiqué)
+        # 2) project/dataset/table alphanum + '_' + '-' (pour le project)
+        #    avec 0 à 2 segments '.'
+        pattern = r"\b(FROM|JOIN)\s+(?:\n|\r|\s)*(`[^`]+`|[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_]+){0,2})(?!\s*\()"
+
+        def normalize(name: str) -> str:
+            if name.startswith("`") and name.endswith("`"):
+                name = name[1:-1]
+            return name.strip()
+
         def repl(m):
             kw = m.group(1)
-            full = m.group(2).strip("`")
-            parts = full.split(".")
+            token = normalize(m.group(2))
+            parts = token.split(".")
+            # Si on a déjà project.dataset.table → on ne touche pas
             if len(parts) == 3:
-                # déjà project.dataset.table → inchangé
-                return f"{kw} `{full}`"
+                return f"{kw} `{token}`"
+            # dataset.table → préfixer avec PROJECT
             if len(parts) == 2:
                 ds, tbl = parts
                 return f"{kw} `{PROJECT}.{ds}.{tbl}`"
-            # len==1
-            return f"{kw} `{PROJECT}.{DATASET}.{parts[0]}`"
+            # table → préfixer avec PROJECT.DATASET
+            if len(parts) == 1:
+                tbl = parts[0]
+                return f"{kw} `{PROJECT}.{DATASET}.{tbl}`"
+            # fallback parano
+            return f"{kw} `{token}`"
+
         return re.sub(pattern, repl, q, flags=re.IGNORECASE)
+
+    # Si le LLM a déjà écrit project.dataset.table SANS backticks (ex: avisia-training.xxx.yyy),
+    # on ajoute les backticks autour des 3 parties pour éviter l'erreur sur le '-'.
+    def backtick_3part_with_project(q: str) -> str:
+        proj = re.escape(PROJECT)  # gère le tiret
+        # autorise ds et table non quotés (letters/digits/_), pas d’espaces
+        pat = rf"(?<!`)({proj}\.[A-Za-z_]\w*\.[A-Za-z_]\w*)(?!`)"
+        return re.sub(pat, r"`\1`", q)
 
 
     # Appliquer la qualification uniquement si l'agent a "oublié" le nom complet
     # On vérifie la présence du nom du projet dans la requête pour décider.
 
     final_query = qualify_table_names(final_query)
+    final_query = backtick_3part_with_project(final_query)
+    final_query = _sanitize_functions(final_query)
     
     client = _bq_client()
     if not client: return {"error": "Client BigQuery non disponible."}
     
     try:
-        job = client.query(final_query)
+        logging.info(f"Final SQL:\n{final_query}")
+        job = client.query(final_query, location=os.getenv("BQ_LOCATION"))
         rows_iter = job.result(max_results=1000)
         
         cols = [sf.name for sf in rows_iter.schema]
@@ -420,6 +527,14 @@ sql_agent = LlmAgent(
     name="sql_agent", model=MODEL,
     description="Génère et exécute une requête SQL pour répondre à une question, en se basant sur un contexte de schéma.",
     instruction=(
+         "Tu es un worker technique.\n"
+        "• NE T'ADRESSE JAMAIS à l'utilisateur.\n"
+        "• Génère UNE requête SELECT BigQuery (règles ci-dessous), exécute-la via l'outil `run_sql`.\n"
+        "• Quand tu as le résultat (ou une erreur), APPELLE `transfer_to_agent` vers "
+        "`root_agent_reine_des_maracas` avec un message JSON strictement au format :\n"
+        "{ \"agent\":\"sql_agent\", \"question\": <question>, \"sql\": <ta_requête>, \"run_sql_response\": <sortie_de_run_sql> }\n"
+        "• Ne renvoie AUCUN autre texte.\n"
+        "\n"
         "Tu es un expert SQL BigQuery.\n"
         "Tu recevras :\n"
         "- `question`\n"
@@ -461,12 +576,12 @@ root_agent = LlmAgent(
     instruction=(
         "Tu es l'orchestrateur principal. Ton but est de répondre à la question de l'utilisateur en coordonnant les agents spécialisés. Voici ton plan d'action :\n"
         "1. **Étape 1 : Obtenir le Contexte.** Appelle `metadata_agent` avec la question de l'utilisateur pour savoir quelles tables et colonnes sont pertinentes.\n"
-        "2. **Étape 2 : Obtenir les Données.** Après avoir reçu la réponse JSON de `metadata_agent`, tu DOIS immédiatement appeler `transfer_to_agent` vers `sql_agent` en lui envoyant un message EXACTEMENT structuré ainsi :\n"
+        "2. **Étape 2 : Obtenir les Données (OBLIGATOIRE).** Après la réponse JSON de `metadata_agent`, APPELLE IMMÉDIATEMENT la fonction `transfer_to_agent` vers `sql_agent` (ne parle pas à l'utilisateur). Message à envoyer :\n"
         "   - question: \"<question originale>\"\n"
         "   - find_relevant_schema_response: <le JSON retourné par metadata_agent, inchangé>\n"
         "   - consigne: \"Génère une seule requête SELECT BigQuery, entièrement qualifiée avisia-training.reine_des_maracas.*, puis exécute-la via run_sql.\"\n"
         "   Ne modifie pas le JSON de schéma.\n"
-        "   Important : Si tu as appelé `metadata_agent`, ne réponds JAMAIS directement à l'utilisateur tant que `sql_agent` n’a pas renvoyé le résultat.\n"
+        "   Important : Après `metadata_agent`, tu n’adresses JAMAIS de réponse à l’utilisateur avant le retour de `sql_agent`.\n"
         "   Une fois le transfert effectué, attends la sortie de `sql_agent`.\n"
         "3. **Étape 3 : Présenter le Résultat.** La sortie de `sql_agent` est la réponse finale. Présente-la clairement à l'utilisateur.\n"
         "4. **Gestion de l'ambiguïté (si nécessaire) :** Si, à n'importe quelle étape, un agent retourne une erreur ou si la question semble vraiment trop vague, tu peux appeler `ux_agent` pour demander une clarification.\n"
