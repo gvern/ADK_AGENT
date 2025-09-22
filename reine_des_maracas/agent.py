@@ -514,41 +514,76 @@ def run_sql(query: str) -> Dict[str, Any]:
     except Exception as e:
         logging.error(f"Échec du job SQL : {e} sur la requête : {final_query}")
         return {"error": f"Erreur lors de l'exécution de la requête : {str(e)}"}
+    
 def chart_spec(data_json: str, user_intent: str) -> Dict[str, Any]:
-    """Génère une spécification Vega-Lite basique."""
+    """
+    Génére une spec Vega-Lite à partir de data JSON (list[dict]) et de l'intention utilisateur.
+    - Détecte x/y automatiquement (numérique vs texte/date)
+    - Met 'temporal' si la colonne ressemble à une date
+    - 'line' si l'intent suggère une évolution, sinon 'bar'
+    Retour: { "vega_lite_spec": "<json pretty>" } ou { "spec": "<message d'erreur>" }
+    """    
     try:
         data = json.loads(data_json)
         if not isinstance(data, list) or not data:
-            return {"spec": "Données invalides ou vides."}
+            return {"error": "Données invalides ou vides."}
     except json.JSONDecodeError:
-        return {"spec": "Erreur de formatage des données d'entrée (JSON invalide)."}
+        return {"error": "JSON invalide."}
 
-    cols = list(data[0].keys())
-    if len(cols) < 2: return {"spec": "Pas assez de colonnes pour un graphique."}
-    
-    x_field, y_field = None, None
-    for col in cols:
-        val = data[0][col]
-        if isinstance(val, (int, float)) and not y_field:
-            y_field = col
-        elif isinstance(val, str) and not x_field:
-            x_field = col
-    
-    if not x_field or not y_field:
-        x_field, y_field = cols[0], cols[1]
+    # Heuristiques pour nommer X/Y
+    sample = data[0]
+    cols = list(sample.keys())
 
-    mark = "line" if any(kw in user_intent for kw in ["évolution", "tendance", "courbe"]) else "bar"
-    
+    # Si la métrique attendue est claire dans la question
+    intent = user_intent.lower()
+    y_pref = None
+    if "quantité" in intent:
+        y_pref = "quantite_vendue"
+    elif "chiffre" in intent or "ca" in intent:
+        y_pref = "chiffre_affaires"
+
+    # Choisir y: métrique numérique
+    numeric_cols = [c for c in cols if isinstance(sample[c], (int, float))]
+    if y_pref and y_pref in cols:
+        y_field = y_pref
+    else:
+        y_field = numeric_cols[0] if numeric_cols else cols[1]
+
+    # Choisir x: label catégoriel
+    label_cols = [c for c in cols if isinstance(sample[c], str)]
+    # quelques colonnes courantes en priorité
+    for cand in ["LIBELLE_MODELE", "VILLE", "FAMILLE", "ID_MODELE"]:
+        if cand in cols:
+            x_field = cand
+            break
+    else:
+        x_field = label_cols[0] if label_cols else cols[0]
+
+    mark = "line" if any(k in intent for k in ["évolution","tendance","courbe","over time"]) else "bar"
+
     spec = {
         "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
         "data": {"values": data},
+        "transform": [
+            {"calculate": f"isValid(datum['{x_field}']) ? datum['{x_field}'] : 'Non renseigné'", "as": f"{x_field}_label"}
+        ],
         "mark": {"type": mark, "tooltip": True},
         "encoding": {
-            "x": {"field": x_field, "type": "nominal", "axis": {"labelAngle": -45}},
+            "x": {"field": f"{x_field}_label", "type": "nominal", "axis": {"labelAngle": -45}},
             "y": {"field": y_field, "type": "quantitative"},
         },
+        "config": {"axis": {"labelFontSize": 12, "titleFontSize": 12}},
     }
-    return {"vega_lite_spec": json.dumps(spec, indent=2)}
+
+    # Si bar chart catégoriel, trier par la métrique
+    if mark == "bar":
+        spec["encoding"]["x"]["sort"] = f"-{y_field}"
+        spec["width"] = 900  # confortable
+        spec["height"] = 450
+
+    return {"vega_lite_spec": spec}
+
+
 
 # --- Correctif pour l'Automatic Function Calling (AFC) ---
 # Matérialise les annotations de chaînes en types réels pour éviter les erreurs AFC
@@ -561,14 +596,46 @@ def _materialize_annotations(func):
         pass
     return func
 
+# --- Outil de rendu Vega-Lite ---
+def render_vega_block(viz_out: Dict[str, Any]) -> Dict[str, str]:
+    """Construit un bloc de code vega-lite à partir d'une sortie de viz_agent ou d'une spec directe.
+    Accepte soit un objet contenant la clé 'vega_lite_spec', soit directement la spec (dict/str).
+    Retourne {"text": "```vega-lite\n...\n```"}
+    """
+    try:
+        spec = viz_out.get("vega_lite_spec") if isinstance(viz_out, dict) else viz_out
+    except Exception:
+        spec = viz_out
+
+    # Tolérer l'ancienne version qui renvoyait une chaîne JSON
+    if isinstance(spec, str):
+        try:
+            spec = json.loads(spec)
+        except Exception:
+            # Si ce n'est pas du JSON valide, on l'enveloppe dans un objet minimal
+            spec = {"_raw": spec}
+
+    text = "```vega-lite\n" + json.dumps(spec, ensure_ascii=False, indent=2) + "\n```"
+    return {"text": text}
+
 # Matérialiser les annotations des fonctions exposées comme tools
 #_materialize_annotations(find_relevant_schema)
 _materialize_annotations(get_full_schema_context) 
 _materialize_annotations(rag_sql_examples)
 _materialize_annotations(run_sql)
 _materialize_annotations(chart_spec)
+_materialize_annotations(render_vega_block)
 
 # --- Définitions des Agents ---
+
+def _wants_chart(text: str) -> bool:
+    if not text: return False
+    t = text.lower()
+    triggers = [
+        "graph", "graphique", "courbe", "bar chart", "barre", "camembert",
+        "line chart", "visualisation", "viz", "plot", "évolution", "tendance"
+    ]
+    return any(k in t for k in triggers)
 
 ux_agent = LlmAgent(
     name="ux_agent",
@@ -585,9 +652,10 @@ metadata_agent = LlmAgent(
     model=MODEL,
     description="Trouve les tables et colonnes pertinentes pour une question.",
     instruction=(
-
-        "Utilise STRICTEMENT l’outil `get_full_schema_context(question=<question>)`.\n"
-        "Après la réponse de l’outil, renvoie EXACTEMENT l’objet JSON retourné, sans autre texte."
+        "Ta sortie sert UNIQUEMENT de contexte pour d'autres agents.\n"
+        "1) Utilise STRICTEMENT l’outil `find_relevant_schema(question=<question>)`.\n"
+        "2) Renvoie EXACTEMENT l’objet JSON retourné par l’outil, SANS aucun autre texte.\n"
+        "3) Tu ne t’adresses JAMAIS à l’utilisateur."
     ),
     #tools=[find_relevant_schema],
     tools=[get_full_schema_context],
@@ -636,34 +704,41 @@ sql_agent = LlmAgent(
 viz_agent = LlmAgent(
     name="viz_agent",
     model=MODEL,
-    description="Crée une spécification de graphique à partir de données JSON.",
+    description="Génère une spec Vega-Lite à partir de données JSON.",
     instruction=(
-        "Tu recevras des données au format JSON et l'intention de l'utilisateur. "
-        "Utilise l'outil `chart_spec` pour générer une spécification Vega-Lite."
+        "Ne t'adresse JAMAIS à l'utilisateur.\n"
+        "Tu reçois { data_json, user_intent }.\n"
+        "1) Appelle l'outil `chart_spec(data_json=<data_json>, user_intent=<user_intent>)`.\n"
+        "2) Retourne EXCLUSIVEMENT l'objet JSON de sortie de `chart_spec` (sans texte autour)."
     ),
     tools=[chart_spec],
 )
 
 root_agent = LlmAgent(
-    name="root_agent_reine_des_maracas", model=MODEL,
+    name="root_agent_reine_des_maracas",
+    model=MODEL,
     description=(
         "Orchestre les agents spécialisés pour répondre aux questions analytiques. "
         "Après `metadata_agent`, transfert obligatoire vers `sql_agent` via `transfer_to_agent` avec la question, la réponse de schéma et la consigne."
     ),
     instruction=(
-        "Tu es l'orchestrateur principal. Ton but est de répondre à la question de l'utilisateur en coordonnant les agents spécialisés. Voici ton plan d'action :\n"
-        "1. **Étape 1 : Obtenir le Contexte.** Appelle `metadata_agent` avec la question de l'utilisateur pour savoir quelles tables et colonnes sont pertinentes.\n"
-        "2. **Étape 2 : Obtenir les Données (OBLIGATOIRE).** Après la réponse JSON de `metadata_agent`, APPELLE IMMÉDIATEMENT la fonction `transfer_to_agent` vers `sql_agent` (ne parle pas à l'utilisateur). Message à envoyer :\n"
-        "   - question: \"<question originale>\"\n"
-        "   - get_full_schema_context_response: <le JSON retourné par metadata_agent, inchangé>\n"
-        "   - consigne: \"Génère une seule requête SELECT BigQuery, entièrement qualifiée avisia-training.reine_des_maracas.*, puis exécute-la via run_sql.\"\n"
-        "   Ne modifie pas le JSON de schéma.\n"
+        "Tu es le SEUL agent autorisé à parler à l'utilisateur.\n"
+        "\n"
+        "Flux :\n"
+        "1) Appelle `metadata_agent` pour le contexte.\n"
+        "2) Transfère à `sql_agent` (via `transfer_to_agent`) avec {question, find_relevant_schema_response}.\n"
         "   Important : Après `metadata_agent`, tu n’adresses JAMAIS de réponse à l’utilisateur avant le retour de `sql_agent`.\n"
         "   Une fois le transfert effectué, attends la sortie de `sql_agent`.\n"
-        "3. **Étape 3 : Présenter le Résultat.** La sortie de `sql_agent` est la réponse finale. Présente-la clairement à l'utilisateur.\n"
-        "4. **Gestion de l'ambiguïté (si nécessaire) :** Si, à n'importe quelle étape, un agent retourne une erreur ou si la question semble vraiment trop vague, tu peux appeler `ux_agent` pour demander une clarification.\n"
-        "5. **Visualisation (Optionnel) :** Si la question initiale demande un 'graphique' ou une 'visualisation' et que tu as obtenu des données de `sql_agent`, passe ces données et la question à `viz_agent`."
+        "3) À la réception de la réponse de `sql_agent` (via `transfer_to_agent`), si `run_sql_response.result` contient des lignes :\n"
+        "   - Si la question de l'utilisateur demande un graphique (détecte des mots comme 'graphique', 'courbe', 'barre', 'visualisation', 'évolution', 'tendance'),\n"
+        "     alors transfère à `viz_agent` avec { data_json: run_sql_response.result, user_intent: <question originale> }.\n"
+        "   - Sinon, formate directement la réponse tabulaire pour l'utilisateur.\n"
+        "4) À la réception de `viz_agent` (via `transfer_to_agent`), APPELLE l'outil `render_vega_block(viz_out=<réponse de viz_agent>)` et RENVOIE STRICTEMENT la clé `text` en sortie (sans autre texte).\n"
+        "5) NE JAMAIS afficher les JSON intermédiaires (`metadata_agent`, `viz_agent` brut, etc.).\n"
+        "6) En cas d'erreur dans `run_sql_response` ou `chart`, explique clairement l'erreur.\n"
+        "7) En cas d'ambiguïté, tu peux appeler `ux_agent` pour clarifier la question."
     ),
+    tools=[render_vega_block],
     sub_agents=[ux_agent, metadata_agent, sql_agent, viz_agent],
 )
 
