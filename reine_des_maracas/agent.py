@@ -227,113 +227,182 @@ def _sanitize_functions(q: str) -> str:
     return q
 
 # --- Outils pour les Agents ---
-def find_relevant_schema(question: str) -> Dict[str, Any]:
+#def find_relevant_schema(question: str) -> Dict[str, Any]:
+    #"""
+    #Retourne:
+      #- relevant_tables: {table: [colonnes pertinentes]}
+      #- schema_details:  tables -> champs (name, type, mode, description, allowed_values, format), joins filtrés
+      #- business_concepts: metrics/dimensions depuis table_description.json
+    #"""
+    #if not _SEMANTIC_INDEX:
+        #return {"error": "L'index sémantique n'est pas initialisé."}
+#
+    ## 1) Recherche sémantique
+    #search_results = _SEMANTIC_INDEX.search(question, top_k=20)
+#
+    #table_context = defaultdict(list)
+    #for res in search_results:
+        #if res["score"] > 0.45:
+            #table_context[res["table"]].append(res["field"])
+#
+    ## 2) Safety nets (ventes/ville)
+    #ql = question.lower()
+    ## élargit le déclencheur "ventes" pour couvrir "vendu", "best sellers", etc.
+    #ventes_trigs = [
+        #"vente", "ventes", "vendu", "vendus",
+        #"meilleures ventes", "meilleurs ventes", "best sellers", "top ventes",
+        #"chiffre d'affaires", "ca"
+    #]
+    #if ("ticket_caisse" in table_context) or any(k in ql for k in ventes_trigs):
+        #must_tc = ["DATE_TICKET", "PRIX_AP_REMISE", "QUANTITE", "CODE_BOUTIQUE", "ANNULATION", "ANNULATION_IMMEDIATE"]
+        #table_context["ticket_caisse"] = sorted(set(table_context["ticket_caisse"] + must_tc))
+    #if any(city in ql for city in ["paris", "lyon", "marseille", "toulouse", "lille"]):
+        #must_m = ["VILLE", "CODE_BOUTIQUE"]
+        #table_context["magasin"] = sorted(set(table_context["magasin"] + must_m))
+#
+    ## Fallback si vide
+    #if not table_context:
+        #table_context = {
+            #"ticket_caisse": ["DATE_TICKET", "PRIX_AP_REMISE", "QUANTITE", "CODE_BOUTIQUE", "ANNULATION", "ANNULATION_IMMEDIATE"],
+            #"magasin": ["VILLE", "CODE_BOUTIQUE"],
+        #}
+#
+    ## 3) Enrichissement: types, descriptions, allowed_values, format
+    #enriched = get_enriched_schema()          # merge live + statique
+    #static_desc = _load_static_descriptions() # brut du JSON (pour joins/concepts)
+#
+    ## index rapides
+    #tbl_map = {t["name"]: t for t in enriched.get("tables", [])}
+    #static_tbl_map = {t["name"]: t for t in static_desc.get("tables", [])}
+#
+    #schema_details = {"tables": {}}
+#
+    ## ne garder que les tables pertinentes
+    #kept_tables = set(table_context.keys())
+#
+    #for tname in kept_tables:
+        #t_live = tbl_map.get(tname, {"fields": []})
+        #t_static = static_tbl_map.get(tname, {"fields": []})
+        ## map pour retrouver allowed_values/format du JSON statique
+        #stat_fields = {f["name"]: f for f in t_static.get("fields", [])}
+#
+        #fields_out = []
+        #for f in t_live.get("fields", []):
+            #fname = f.get("name")
+            #if fname in set(table_context[tname]):  # ne sortir que les colonnes pertinentes
+                #stat = stat_fields.get(fname, {})
+                #fields_out.append({
+                    #"name": fname,
+                    #"type": f.get("type"),
+                    #"mode": f.get("mode"),
+                    #"description": f.get("description") or stat.get("description"),
+                    #"allowed_values": stat.get("allowed_values"),
+                    #"format": stat.get("format"),
+                    #"key": stat.get("key"),
+                #})
+#
+        #pk = [ff["name"] for ff in t_static.get("fields", []) if str(ff.get("key","")).startswith("PRIMARY_KEY")]
+        #fk = [ff["name"] for ff in t_static.get("fields", []) if "FOREIGN_KEY" in str(ff.get("key",""))]
+        #schema_details["tables"][tname] = {
+            #"description": t_live.get("description"),
+            #"fields": fields_out,
+            #"joins": [],
+            #"keys": {"primary": pk, "foreign": fk},
+        #}
+#
+    ## 4) Relations (joins) filtrées aux tables retenues
+    #joins = static_desc.get("relations", [])
+    #filtered_joins = []
+    #for j in joins:
+        #left_tbl = j.get("left", "").split(".")[0]
+        #right_tbl = j.get("right", "").split(".")[0]
+        #if left_tbl in kept_tables or right_tbl in kept_tables:
+            #filtered_joins.append(j)
+    ## distribuer par table
+    #for j in filtered_joins:
+        #for side in ["left", "right"]:
+            #t_side = j.get(side, "").split(".")[0]
+            #if t_side in schema_details["tables"]:
+                #schema_details["tables"][t_side]["joins"].append(j)
+#
+    ## 5) Règles métier (concepts)
+    #business_concepts = static_desc.get("concepts", {})
+#
+    #return {
+        #"relevant_tables": dict(table_context),
+        #"schema_details": schema_details,
+        #"business_concepts": business_concepts,
+    #}
+
+def get_full_schema_context() -> Dict[str, Any]:
     """
-    Retourne:
-      - relevant_tables: {table: [colonnes pertinentes]}
-      - schema_details:  tables -> champs (name, type, mode, description, allowed_values, format), joins filtrés
-      - business_concepts: metrics/dimensions depuis table_description.json
+    Charge et retourne le contexte complet du schéma de la base de données.
+    Cette fonction remplace `find_relevant_schema` pour fournir toutes les tables,
+    colonnes, relations et concepts métier à l'agent SQL.
     """
-    if not _SEMANTIC_INDEX:
-        return {"error": "L'index sémantique n'est pas initialisé."}
-
-    # 1) Recherche sémantique
-    search_results = _SEMANTIC_INDEX.search(question, top_k=20)
-
-    table_context = defaultdict(list)
-    for res in search_results:
-        if res["score"] > 0.45:
-            table_context[res["table"]].append(res["field"])
-
-    # 2) Safety nets (ventes/ville)
-    ql = question.lower()
-    # élargit le déclencheur "ventes" pour couvrir "vendu", "best sellers", etc.
-    ventes_trigs = [
-        "vente", "ventes", "vendu", "vendus",
-        "meilleures ventes", "meilleurs ventes", "best sellers", "top ventes",
-        "chiffre d'affaires", "ca"
-    ]
-    if ("ticket_caisse" in table_context) or any(k in ql for k in ventes_trigs):
-        must_tc = ["DATE_TICKET", "PRIX_AP_REMISE", "QUANTITE", "CODE_BOUTIQUE", "ANNULATION", "ANNULATION_IMMEDIATE"]
-        table_context["ticket_caisse"] = sorted(set(table_context["ticket_caisse"] + must_tc))
-    if any(city in ql for city in ["paris", "lyon", "marseille", "toulouse", "lille"]):
-        must_m = ["VILLE", "CODE_BOUTIQUE"]
-        table_context["magasin"] = sorted(set(table_context["magasin"] + must_m))
-
-    # Fallback si vide
-    if not table_context:
-        table_context = {
-            "ticket_caisse": ["DATE_TICKET", "PRIX_AP_REMISE", "QUANTITE", "CODE_BOUTIQUE", "ANNULATION", "ANNULATION_IMMEDIATE"],
-            "magasin": ["VILLE", "CODE_BOUTIQUE"],
-        }
-
-    # 3) Enrichissement: types, descriptions, allowed_values, format
-    enriched = get_enriched_schema()          # merge live + statique
-    static_desc = _load_static_descriptions() # brut du JSON (pour joins/concepts)
-
-    # index rapides
-    tbl_map = {t["name"]: t for t in enriched.get("tables", [])}
-    static_tbl_map = {t["name"]: t for t in static_desc.get("tables", [])}
+    enriched_schema = get_enriched_schema()
+    static_desc = _load_static_descriptions()
 
     schema_details = {"tables": {}}
+    relevant_tables = {}
+    
+    # Indexer les descriptions statiques pour un accès rapide
+    static_table_map = {t["name"]: t for t in static_desc.get("tables", [])}
 
-    # ne garder que les tables pertinentes
-    kept_tables = set(table_context.keys())
-
-    for tname in kept_tables:
-        t_live = tbl_map.get(tname, {"fields": []})
-        t_static = static_tbl_map.get(tname, {"fields": []})
-        # map pour retrouver allowed_values/format du JSON statique
-        stat_fields = {f["name"]: f for f in t_static.get("fields", [])}
+    # 1. Construire les détails de chaque table et champ
+    for table_data in enriched_schema.get("tables", []):
+        table_name = table_data["name"]
+        
+        # Obtenir les infos statiques pour cette table
+        static_table = static_table_map.get(table_name, {"fields": []})
+        static_fields_map = {f["name"]: f for f in static_table.get("fields", [])}
 
         fields_out = []
-        for f in t_live.get("fields", []):
+        all_field_names = [f["name"] for f in table_data.get("fields", [])]
+        
+        for f in table_data.get("fields", []):
             fname = f.get("name")
-            if fname in set(table_context[tname]):  # ne sortir que les colonnes pertinentes
-                stat = stat_fields.get(fname, {})
-                fields_out.append({
-                    "name": fname,
-                    "type": f.get("type"),
-                    "mode": f.get("mode"),
-                    "description": f.get("description") or stat.get("description"),
-                    "allowed_values": stat.get("allowed_values"),
-                    "format": stat.get("format"),
-                    "key": stat.get("key"),
-                })
+            stat = static_fields_map.get(fname, {})
+            fields_out.append({
+                "name": fname,
+                "type": f.get("type"),
+                "mode": f.get("mode"),
+                "description": f.get("description") or stat.get("description"),
+                "allowed_values": stat.get("allowed_values"),
+                "format": stat.get("format"),
+                "key": stat.get("key"),
+            })
+        
+        # Remplir la liste des "tables pertinentes" avec toutes les colonnes
+        relevant_tables[table_name] = all_field_names
 
-        pk = [ff["name"] for ff in t_static.get("fields", []) if str(ff.get("key","")).startswith("PRIMARY_KEY")]
-        fk = [ff["name"] for ff in t_static.get("fields", []) if "FOREIGN_KEY" in str(ff.get("key",""))]
-        schema_details["tables"][tname] = {
-            "description": t_live.get("description"),
+        # Extraire les clés primaires et étrangères
+        pk = [ff["name"] for ff in static_table.get("fields", []) if str(ff.get("key","")).startswith("PRIMARY_KEY")]
+        fk = [ff["name"] for ff in static_table.get("fields", []) if "FOREIGN_KEY" in str(ff.get("key",""))]
+
+        schema_details["tables"][table_name] = {
+            "description": table_data.get("description"),
             "fields": fields_out,
-            "joins": [],
+            "joins": [], # Sera rempli à l'étape suivante
             "keys": {"primary": pk, "foreign": fk},
         }
 
-    # 4) Relations (joins) filtrées aux tables retenues
-    joins = static_desc.get("relations", [])
-    filtered_joins = []
-    for j in joins:
-        left_tbl = j.get("left", "").split(".")[0]
-        right_tbl = j.get("right", "").split(".")[0]
-        if left_tbl in kept_tables or right_tbl in kept_tables:
-            filtered_joins.append(j)
-    # distribuer par table
-    for j in filtered_joins:
+    # 2. Ajouter toutes les relations (joins)
+    all_joins = static_desc.get("relations", [])
+    for j in all_joins:
         for side in ["left", "right"]:
             t_side = j.get(side, "").split(".")[0]
             if t_side in schema_details["tables"]:
                 schema_details["tables"][t_side]["joins"].append(j)
 
-    # 5) Règles métier (concepts)
+    # 3. Ajouter tous les concepts métier
     business_concepts = static_desc.get("concepts", {})
 
     return {
-        "relevant_tables": dict(table_context),
+        "relevant_tables": relevant_tables,
         "schema_details": schema_details,
         "business_concepts": business_concepts,
     }
-
 
 def rag_sql_examples(question: str) -> Dict[str, Any]:
     """Récupère des exemples de questions-SQL similaires à la question de l'utilisateur."""
@@ -493,7 +562,8 @@ def _materialize_annotations(func):
     return func
 
 # Matérialiser les annotations des fonctions exposées comme tools
-_materialize_annotations(find_relevant_schema)
+#_materialize_annotations(find_relevant_schema)
+_materialize_annotations(get_full_schema_context) 
 _materialize_annotations(rag_sql_examples)
 _materialize_annotations(run_sql)
 _materialize_annotations(chart_spec)
@@ -516,10 +586,11 @@ metadata_agent = LlmAgent(
     description="Trouve les tables et colonnes pertinentes pour une question.",
     instruction=(
 
-        "Utilise STRICTEMENT l’outil `find_relevant_schema(question=<question>)`.\n"
+        "Utilise STRICTEMENT l’outil `get_full_schema_context(question=<question>)`.\n"
         "Après la réponse de l’outil, renvoie EXACTEMENT l’objet JSON retourné, sans autre texte."
     ),
-    tools=[find_relevant_schema],
+    #tools=[find_relevant_schema],
+    tools=[get_full_schema_context],
 )
 
 
@@ -538,7 +609,7 @@ sql_agent = LlmAgent(
         "Tu es un expert SQL BigQuery.\n"
         "Tu recevras :\n"
         "- `question`\n"
-        "- `find_relevant_schema_response` (avec `relevant_tables`, `schema_details`=tables/fields/joins et `business_concepts`)\n"
+        "- `get_full_schema_context_response` (avec `relevant_tables`, `schema_details`=tables/fields/joins et `business_concepts`)\n"
         "- `examples`\n"
         "**RÈGLE ABSOLUE :** Ta requête DOIT qualifier chaque nom de table avec `avisia-training.reine_des_maracas.`. Par exemple : `FROM `avisia-training.reine_des_maracas.ticket_caisse` AS t`.\n"
         "Règles strictes :\n"
@@ -546,10 +617,16 @@ sql_agent = LlmAgent(
         "• N’emploie que les colonnes présentes dans `schema_details.tables[*].fields`.\n"
         "• Si la question correspond à un concept métier, utilise `business_concepts.metrics/dimensions` (expression SQL).\n"
         "• `DATE_TICKET` est STRING au format DD/MM/YYYY → `SAFE.PARSE_DATE('%d/%m/%Y', t.DATE_TICKET)` pour tout EXTRACT/filtre.\n"
-        "• `ANNULATION` et `ANNULATION_IMMEDIATE` sont BOOL → filtre avec `NOT t.ANNULATION AND NOT t.ANNULATION_IMMEDIATE`.\n"
-        "• Pour filtrer les villes, fais une comparaison insensible à la casse :UPPER(m.VILLE) = UPPER('<valeur utilisateur>').\n"
         "• Toutes les tables doivent être **entièrement qualifiées** `avisia-training.reine_des_maracas.*`.\n"
         "• Mesure principale alias `ca` et enveloppée par `COALESCE(...,0)`.\n"
+        "**RÈGLES DE ROBUSTESSE SQL (OBLIGATOIRES) :**\n"
+        "✅ **Qualif. complète :** Toutes les tables DOIVENT être qualifiées : `avisia-training.reine_des_maracas.nom_table`.\n"
+        "✅ **Jointures Inclusives :** Utilise systématiquement `LEFT JOIN` en partant de la table de transactions (`ticket_caisse`) pour ne perdre aucune vente, même si les informations associées sont manquantes.\n"
+        "✅ **Filtres sur Texte :** Pour toute comparaison de chaînes de caractères (villes, régions, etc.), rends-la insensible à la casse et aux espaces. Utilise le format `UPPER(TRIM(colonne)) = 'VALEUR_EN_MAJUSCULES'`. Exemple : `WHERE UPPER(TRIM(m.REGIONS)) = 'PARIS'`.\n"
+        "✅ **Filtres sur Booléens (Annulations) :** Pour filtrer les ventes valides, gère les `NULL` potentiels sur les colonnes `ANNULATION` et `ANNULATION_IMMEDIATE`. Utilise `COALESCE(t.ANNULATION, FALSE) = FALSE` au lieu de `NOT t.ANNULATION`.\n"
+        "✅ **Agrégations Sûres :** Enveloppe TOUTES les fonctions d'agrégation (`SUM`, `AVG`, etc.) avec `COALESCE(..., 0)` pour garantir un résultat numérique (`0`) au lieu de `NULL` en l'absence de données. Exemple : `COALESCE(SUM(t.QUANTITE), 0)`.\n"
+        "✅ **Gestion des Dates :** `DATE_TICKET` est une STRING `DD/MM/YYYY`. Utilise toujours `SAFE.PARSE_DATE('%d/%m/%Y', t.DATE_TICKET)` pour les filtres ou les extractions de date.\n"
+        "✅ **Concepts Métier :** Si la question de l'utilisateur correspond à un `business_concepts`, utilise l'expression SQL fournie."
         "Ensuite, exécute via `run_sql` et renvoie son résultat."
     ),
     tools=[rag_sql_examples, run_sql],
@@ -578,7 +655,7 @@ root_agent = LlmAgent(
         "1. **Étape 1 : Obtenir le Contexte.** Appelle `metadata_agent` avec la question de l'utilisateur pour savoir quelles tables et colonnes sont pertinentes.\n"
         "2. **Étape 2 : Obtenir les Données (OBLIGATOIRE).** Après la réponse JSON de `metadata_agent`, APPELLE IMMÉDIATEMENT la fonction `transfer_to_agent` vers `sql_agent` (ne parle pas à l'utilisateur). Message à envoyer :\n"
         "   - question: \"<question originale>\"\n"
-        "   - find_relevant_schema_response: <le JSON retourné par metadata_agent, inchangé>\n"
+        "   - get_full_schema_context_response: <le JSON retourné par metadata_agent, inchangé>\n"
         "   - consigne: \"Génère une seule requête SELECT BigQuery, entièrement qualifiée avisia-training.reine_des_maracas.*, puis exécute-la via run_sql.\"\n"
         "   Ne modifie pas le JSON de schéma.\n"
         "   Important : Après `metadata_agent`, tu n’adresses JAMAIS de réponse à l’utilisateur avant le retour de `sql_agent`.\n"
