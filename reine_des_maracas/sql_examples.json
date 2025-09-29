@@ -49,25 +49,74 @@
     "sql": "WITH base AS (\n  SELECT COUNT(DISTINCT NUM_TICKET) AS total_tickets\n  FROM `.`avisia-training.reine_des_maracas.ticket_caisse``\n  WHERE SAFE.PARSE_DATE('%d/%m/%Y', DATE_TICKET) >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)\n), ann AS (\n  SELECT COUNT(DISTINCT NUM_TICKET) AS annules\n  FROM `.`avisia-training.reine_des_maracas.ticket_caisse``\n  WHERE ANNULATION_IMMEDIATE IS TRUE\n    AND SAFE.PARSE_DATE('%d/%m/%Y', DATE_TICKET) >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)\n)\nSELECT ann.annules, base.total_tickets, SAFE_DIVIDE(ann.annules, base.total_tickets) AS taux_annulation_immediate\nFROM ann CROSS JOIN base",
     "notes": "Ratio annulations immédiates"
   },
-
   {
     "question": "Quel est le chiffre d'affaires total pour l'année 2020 ?",
-    "query": "SELECT SUM(t.PRIX_AP_REMISE * t.QUANTITE) AS total_revenue FROM `avisia-training.reine_des_maracas.ticket_caisse` AS t WHERE SAFE.PARSE_DATE('%d/%m/%Y', t.DATE_TICKET) BETWEEN '2020-01-01' AND '2020-12-31'"
+    "sql": "SELECT SUM(t.PRIX_AP_REMISE * t.QUANTITE) AS total_revenue FROM `avisia-training.reine_des_maracas.ticket_caisse` AS t WHERE SAFE.PARSE_DATE('%d/%m/%Y', t.DATE_TICKET) BETWEEN '2020-01-01' AND '2020-12-31'",
+    "notes": "CA total année 2020"
   },
   {
     "question": "Quelles sont les 5 familles de produits les plus vendues en quantité ?",
-    "query": "SELECT p.FAMILLE, SUM(t.QUANTITE) AS total_quantity FROM `avisia-training.reine_des_maracas.ticket_caisse` AS t LEFT JOIN referentiel AS r ON t.CODE_LIGNE = r.ID_ARTICLE LEFT JOIN typo_produit AS p ON r.ID_MODELE = p.ID_MODELE GROUP BY p.FAMILLE ORDER BY total_quantity DESC LIMIT 5"
+    "sql": "SELECT p.FAMILLE, SUM(t.QUANTITE) AS total_quantity FROM `avisia-training.reine_des_maracas.ticket_caisse` AS t LEFT JOIN referentiel AS r ON t.CODE_LIGNE = r.ID_ARTICLE LEFT JOIN typo_produit AS p ON r.ID_MODELE = p.ID_MODELE GROUP BY p.FAMILLE ORDER BY total_quantity DESC LIMIT 5",
+    "notes": "Top 5 familles par quantité"
   },
   {
     "question": "Montre-moi le chiffre d'affaires par ville.",
-    "query": "SELECT m.VILLE, SUM(t.PRIX_AP_REMISE * t.QUANTITE) AS total_revenue FROM `avisia-training.reine_des_maracas.ticket_caisse` AS t LEFT JOIN magasin AS m ON t.CODE_BOUTIQUE = m.CODE_BOUTIQUE GROUP BY m.VILLE ORDER BY total_revenue DESC"
+    "sql": "SELECT m.VILLE, SUM(t.PRIX_AP_REMISE * t.QUANTITE) AS total_revenue FROM `avisia-training.reine_des_maracas.ticket_caisse` AS t LEFT JOIN magasin AS m ON t.CODE_BOUTIQUE = m.CODE_BOUTIQUE GROUP BY m.VILLE ORDER BY total_revenue DESC",
+    "notes": "CA par ville"
   },
   {
     "question": "Quel ticket de caisse a la plus grande quantité d'articles ?",
-    "query": "SELECT NUM_TICKET, SUM(QUANTITE) as total_items FROM `avisia-training.reine_des_maracas.ticket_caisse` GROUP BY NUM_TICKET ORDER BY total_items DESC LIMIT 1"
+    "sql": "SELECT NUM_TICKET, SUM(QUANTITE) as total_items FROM `avisia-training.reine_des_maracas.ticket_caisse` GROUP BY NUM_TICKET ORDER BY total_items DESC LIMIT 1",
+    "notes": "Ticket avec le plus d'articles"
   },
   {
     "question": "Quel est le total des ventes pour l'année 2021 ?",
-    "query": "SELECT SUM(PRIX_AP_REMISE * QUANTITE) FROM `avisia-training.reine_des_maracas.ticket_caisse` WHERE EXTRACT(YEAR FROM SAFE.PARSE_DATE('%d/%m/%Y', DATE_TICKET)) = 2021"
+    "sql": "SELECT SUM(PRIX_AP_REMISE * QUANTITE) FROM `avisia-training.reine_des_maracas.ticket_caisse` WHERE EXTRACT(YEAR FROM SAFE.PARSE_DATE('%d/%m/%Y', DATE_TICKET)) = 2021",
+    "notes": "Total ventes 2021"
+  },
+  {
+    "question": "Quel est le nombre total de clients dans notre base ?",
+    "sql": "SELECT COUNT(DISTINCT ID_INDIVIDU) as nombre_total_clients FROM `avisia-self-service-analytics.reine_des_maracas.individu`",
+    "notes": "Nombre total de clients"
+  },
+  {
+    "question": "Combien de magasins avons-nous à Paris ?",
+    "sql": "SELECT COUNT(*) as nombre_magasins_paris FROM `avisia-self-service-analytics.reine_des_maracas.magasin` WHERE REGIONS = 'Paris'",
+    "notes": "Nombre de magasins parisiens"
+  },
+  {
+    "question": "Quel est le chiffre d'affaires total de l'année 2023 ?",
+    "sql": "SELECT SUM(PRIX_AP_REMISE * QUANTITE) as ca_total_2023 FROM `avisia-self-service-analytics.reine_des_maracas.ticket_caisse` WHERE SUBSTR(DATE_TICKET, 7, 4) = '2023' AND ANNULATION = False",
+    "notes": "CA total 2023, hors annulations"
+  },
+  {
+    "question": "Quel est le produit le plus vendu en termes de quantité totale ?",
+    "sql": "SELECT r.ID_ARTICLE, SUM(tc.QUANTITE) AS quantite_totale FROM `avisia-self-service-analytics.reine_des_maracas.ticket_caisse` tc JOIN `avisia-self-service-analytics.reine_des_maracas.referentiel` r ON tc.EAN = r.EAN WHERE tc.ANNULATION = False GROUP BY r.ID_ARTICLE ORDER BY quantite_totale DESC LIMIT 1",
+    "notes": "Produit le plus vendu en quantité"
+  },
+  {
+    "question": "Quels sont les 5 modèles de maillots de bain les plus vendus ?",
+    "sql": "SELECT tp.LIBELLE_MODELE, SUM(tc.QUANTITE) as total_ventes FROM `avisia-self-service-analytics.reine_des_maracas.ticket_caisse` tc JOIN `avisia-self-service-analytics.reine_des_maracas.referentiel` ref ON tc.EAN = ref.EAN JOIN `avisia-self-service-analytics.reine_des_maracas.typo_produit` tp ON ref.ID_MODELE = tp.ID_MODELE WHERE tp.LIGNE = 'Bain' AND tc.ANNULATION = False GROUP BY tp.LIBELLE_MODELE ORDER BY total_ventes DESC LIMIT 5",
+    "notes": "Top 5 maillots de bain"
+  },
+  {
+    "question": "Quel est le montant total des remises accordées en 2022 par type de magasin ?",
+    "sql": "SELECT m.TYPE_MAGASIN, SUM(tc.REMISE) AS total_remises FROM `avisia-self-service-analytics.reine_des_maracas.ticket_caisse` tc JOIN `avisia-self-service-analytics.reine_des_maracas.magasin` m ON tc.CODE_BOUTIQUE = m.CODE_BOUTIQUE WHERE EXTRACT(YEAR FROM PARSE_DATE('%d/%m/%Y', tc.DATE_TICKET)) = 2022 AND tc.ANNULATION = False GROUP BY m.TYPE_MAGASIN",
+    "notes": "Remises 2022 par type de magasin"
+  },
+  {
+    "question": "Quelle est l'évolution mensuelle du panier moyen par magasin en centre-ville sur les 6 derniers mois de 2023 ?",
+    "sql": "WITH tickets_par_mois AS (SELECT m.VILLE, SUBSTR(tc.DATE_TICKET, 4, 7) as mois, COUNT(DISTINCT tc.NUM_TICKET) as nombre_tickets, SUM(tc.PRIX_AP_REMISE * tc.QUANTITE) as ca_total FROM `avisia-self-service-analytics.reine_des_maracas.ticket_caisse` tc JOIN `avisia-self-service-analytics.reine_des_maracas.magasin` m ON tc.CODE_BOUTIQUE = m.CODE_BOUTIQUE WHERE m.CENTRE_VILLE IN ('Centre Ville', 'Centre ville') AND SUBSTR(tc.DATE_TICKET, 7, 4) = '2023' AND SUBSTR(tc.DATE_TICKET, 4, 7) >= '07/2023' AND tc.ANNULATION = False GROUP BY m.VILLE, SUBSTR(tc.DATE_TICKET, 4, 7)) SELECT VILLE, mois, ROUND(ca_total / nombre_tickets, 2) as panier_moyen FROM tickets_par_mois ORDER BY VILLE, mois",
+    "notes": "Évolution panier moyen centre-ville 2023"
+  },
+  {
+    "question": "Quels sont les magasins qui surperforment en termes de ventes de nouveaux clients (RC) par rapport à la moyenne nationale ?",
+    "sql": "WITH moyenne_nationale AS (SELECT AVG(ventes_nouveaux) as moyenne_ventes_nouveaux FROM (SELECT tc.CODE_BOUTIQUE, SUM(tc.PRIX_AP_REMISE * tc.QUANTITE) as ventes_nouveaux FROM `avisia-self-service-analytics.reine_des_maracas.ticket_caisse` tc JOIN `avisia-self-service-analytics.reine_des_maracas.complement_individu` ci ON tc.ID_INDIVIDU = ci.ID_INDIVIDU WHERE ci.SEGACT = 'RC' AND tc.ANNULATION = False GROUP BY tc.CODE_BOUTIQUE)) SELECT m.VILLE, m.REGIONS, m.CENTRE_VILLE, SUM(tc.PRIX_AP_REMISE * tc.QUANTITE) as ventes_nouveaux, mn.moyenne_ventes_nouveaux, ROUND((SUM(tc.PRIX_AP_REMISE * tc.QUANTITE) / mn.moyenne_ventes_nouveaux - 1) * 100, 2) as performance_vs_moyenne FROM `avisia-self-service-analytics.reine_des_maracas.ticket_caisse` tc JOIN `avisia-self-service-analytics.reine_des_maracas.complement_individu` ci ON tc.ID_INDIVIDU = ci.ID_INDIVIDU JOIN `avisia-self-service-analytics.reine_des_maracas.magasin` m ON tc.CODE_BOUTIQUE = m.CODE_BOUTIQUE CROSS JOIN moyenne_nationale mn WHERE ci.SEGACT = 'RC' AND tc.ANNULATION = False GROUP BY m.VILLE, m.REGIONS, m.CENTRE_VILLE, mn.moyenne_ventes_nouveaux HAVING performance_vs_moyenne > 0 ORDER BY performance_vs_moyenne DESC",
+    "notes": "Magasins surperformants ventes nouveaux clients"
+  },
+  {
+    "question": "Quel est le taux de conversion des clientes entre leur premier achat de lingerie et un achat suivant en balnéaire dans les 6 mois ?",
+    "sql": "WITH premier_achat_lingerie AS (SELECT tc.ID_INDIVIDU, MIN(tc.DATE_TICKET) as date_premier_achat FROM `avisia-self-service-analytics.reine_des_maracas.ticket_caisse` tc JOIN `avisia-self-service-analytics.reine_des_maracas.referentiel` ref ON tc.EAN = ref.EAN JOIN `avisia-self-service-analytics.reine_des_maracas.typo_produit` tp ON ref.ID_MODELE = tp.ID_MODELE WHERE tp.LIGNE = 'Corseterie' AND tc.ANNULATION = False GROUP BY tc.ID_INDIVIDU), conversion_bain AS (SELECT pal.ID_INDIVIDU, CASE WHEN MIN(tc.DATE_TICKET) IS NOT NULL THEN 1 ELSE 0 END as a_converti FROM premier_achat_lingerie pal LEFT JOIN `avisia-self-service-analytics.reine_des_maracas.ticket_caisse` tc ON pal.ID_INDIVIDU = tc.ID_INDIVIDU LEFT JOIN `avisia-self-service-analytics.reine_des_maracas.referentiel` ref ON tc.EAN = ref.EAN LEFT JOIN `avisia-self-service-analytics.reine_des_maracas.typo_produit` tp ON ref.ID_MODELE = tp.ID_MODELE WHERE tp.LIGNE = 'Bain' AND tc.DATE_TICKET > pal.date_premier_achat AND PARSE_DATE('%d/%m/%Y', tc.DATE_TICKET) <= DATE_ADD(PARSE_DATE('%d/%m/%Y', pal.date_premier_achat), INTERVAL 180 DAY) AND tc.ANNULATION = False GROUP BY pal.ID_INDIVIDU) SELECT COUNT(*) as total_clientes, SUM(a_converti) as converties, ROUND(SUM(a_converti) * 100.0 / COUNT(*), 2) as taux_conversion FROM conversion_bain",
+    "notes": "Taux conversion lingerie vers balnéaire"
   }
 ]

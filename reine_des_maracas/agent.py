@@ -23,6 +23,9 @@ import numpy as np
 from google.cloud import bigquery
 from google.api_core.exceptions import GoogleAPICallError
 from google.adk.agents.llm_agent import LlmAgent
+from google.adk.tools import FunctionTool
+from google.adk.tools.tool_context import ToolContext
+import google.genai.types as genai_types
 
 # --- Vérification et importation des dépendances ---
 try:
@@ -50,6 +53,10 @@ EXAMPLES_PATH = os.getenv(
     "SQL_EXAMPLES_PATH",
     os.path.join(BASE_DIR, "sql_examples.json")
 )
+
+logging.basicConfig(level=logging.INFO) 
+logging.info(f"Chemin des exemples SQL utilisé : {EXAMPLES_PATH}")
+logging.info(f"Le fichier existe-t-il ? {'Oui' if os.path.exists(EXAMPLES_PATH) else 'Non'}")
 
 if VERTEXAI_AVAILABLE:
     try:
@@ -191,12 +198,92 @@ class SemanticIndex:
         return [{**self.metadata[i], "score": sims[i]} for i in sorted_indices]
 
 _SEMANTIC_INDEX: Optional[SemanticIndex] = None
+_SQL_EXAMPLES_INDEX: Dict[str, Any] = {"examples": [], "vectors": np.array([])}
+
+def _initialize_sql_examples_index():
+    """Charge les exemples SQL et pré-calcule leurs embeddings."""
+    global _SQL_EXAMPLES_INDEX
+    if not VERTEXAI_AVAILABLE:
+        logging.warning("L'index des exemples SQL ne peut être initialisé car Vertex AI n'est pas dispo.")
+        return
+
+    examples = _load_sql_examples()
+    if not examples:
+        logging.info("Aucun exemple SQL à indexer.")
+        return
+
+    # On ne calcule les embeddings que pour les questions des exemples
+    example_questions = [ex['question'] for ex in examples]
+    client = EmbeddingClient() # Réutilise le même client que pour le schéma
+    vectors = client.get_embeddings(example_questions)
+
+    # Normaliser les vecteurs une seule fois pour des calculs de similarité plus rapides
+    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+    normalized_vectors = np.divide(vectors, norms, out=np.zeros_like(vectors), where=norms!=0)
+    
+    _SQL_EXAMPLES_INDEX["examples"] = examples
+    _SQL_EXAMPLES_INDEX["vectors"] = normalized_vectors # On stocke les vecteurs normalisés
+    logging.info(f"{len(examples)} exemples SQL ont été chargés et vectorisés.")
+
 def _initialize_components():
     global _SEMANTIC_INDEX
     if VERTEXAI_AVAILABLE and not _SEMANTIC_INDEX:
         client = EmbeddingClient()
         schema = get_enriched_schema()
         _SEMANTIC_INDEX = SemanticIndex.create(schema, client)
+
+# --- Helpers SQL ---
+
+def _extract_cte_names(sql: str) -> set[str]:
+    """
+    Retourne l'ensemble des noms de CTE définis dans un WITH ... .
+    On lit à partir de WITH, on collecte tous les 'nom AS (' jusqu'au SELECT racine
+    (après que la parenthésation des CTE soit revenue à zéro).
+    """
+    s = sql
+    m_with = re.search(r"\bWITH\b", s, flags=re.IGNORECASE)
+    if not m_with:
+        return set()
+
+    i = m_with.end()          # début après WITH
+    depth = 0
+    names: set[str] = set()
+
+    # petit helper pour lire un ident simple (nom de CTE)
+    ident_re = re.compile(r"\s*([A-Za-z_][A-Za-z0-9_]*)\s*AS\s*\(", re.IGNORECASE)
+
+    while i < len(s):
+        # quand depth == 0 et on voit 'SELECT', on considère que la liste des CTE est finie
+        m_sel = re.match(r"\s*SELECT\b", s[i:], flags=re.IGNORECASE)
+        if depth == 0 and m_sel:
+            break
+
+        # essaie de capturer "cte_name AS ("
+        m_cte = ident_re.match(s, i)
+        if m_cte:
+            names.add(m_cte.group(1).lower())
+            i = m_cte.end()  # on est positionné juste après l'ouverture '(' du CTE
+            depth = 1        # on est entré dans le bloc de ce CTE
+            # avance jusqu'à refermer entièrement ce CTE (compte () imbriqués)
+            while i < len(s) and depth > 0:
+                if s[i] == '(':
+                    depth += 1
+                elif s[i] == ')':
+                    depth -= 1
+                i += 1
+            # après la fermeture, on s'attend à une virgule (autre CTE) ou SELECT (racine)
+            # la boucle continue pour potentiellement capturer d'autres CTE
+            continue
+
+        # sinon, avance d'un caractère en gérant la profondeur si on tombe sur ( ou )
+        c = s[i]
+        if c == '(':
+            depth += 1
+        elif c == ')':
+            depth = max(0, depth - 1)
+        i += 1
+
+    return names
 
 # --- Sanitize SQL Functions ---
 def _sanitize_functions(q: str) -> str:
@@ -404,27 +491,95 @@ def get_full_schema_context() -> Dict[str, Any]:
         "business_concepts": business_concepts,
     }
 
-def rag_sql_examples(question: str) -> Dict[str, Any]:
-    """Récupère des exemples de questions-SQL similaires à la question de l'utilisateur."""
-    if not _SEMANTIC_INDEX: return {"examples": "L'index sémantique n'est pas initialisé."}
+def rag_sql_examples(question: str, top_k: int = 3, similarity_threshold: float = 0.65) -> Dict[str, Any]:
+    """
+    Récupère des exemples de questions-SQL similaires à la question de l'utilisateur
+    en utilisant des embeddings pré-calculés.
+    """
+    if not _SQL_EXAMPLES_INDEX["examples"]:
+        return {"examples": []}
+
+    # 1. Calculer l'embedding UNIQUEMENT pour la nouvelle question
+    if not VERTEXAI_AVAILABLE:
+        return {"examples": []}
     
-    examples = _load_sql_examples()
-    if not examples: return {"examples": []}
+    client = EmbeddingClient()
+    query_vec = client.get_embeddings([question])
     
-    example_questions = [ex['question'] for ex in examples]
-    all_texts = [question] + example_questions
-    all_embeddings = _SEMANTIC_INDEX.client.get_embeddings(all_texts)
+    # Gérer le cas où l'embedding échoue
+    if query_vec.size == 0:
+        return {"examples": []}
+
+    # 2. Normaliser le vecteur de la question
+    q_norm = np.linalg.norm(query_vec)
+    if q_norm == 0:
+        return {"examples": []}
+    query_norm_vec = query_vec / q_norm
+
+    # 3. Calculer la similarité avec les vecteurs pré-calculés (très rapide)
+    # C'est un simple produit matriciel car tous les vecteurs sont déjà normalisés
+    sims = np.dot(_SQL_EXAMPLES_INDEX["vectors"], query_norm_vec.T).flatten()
+
+    # 4. Trier et filtrer par seuil
+    # On crée des paires (index, score) pour pouvoir filtrer
+    indexed_sims = sorted(enumerate(sims), key=lambda item: item[1], reverse=True)
     
-    q_vec = all_embeddings[0]
-    ex_vecs = all_embeddings[1:]
-    
-    sims = np.dot(ex_vecs, q_vec.T) / (np.linalg.norm(ex_vecs, axis=1) * np.linalg.norm(q_vec))
-    
-    top_indices = np.argsort(-sims)[:3]
-    
-    # Retourner une liste d'objets JSON, pas une chaîne formatée
-    top_examples = [examples[i] for i in top_indices]
+    top_examples = []
+    for index, score in indexed_sims:
+        if score >= similarity_threshold and len(top_examples) < top_k:
+            # On ajoute le score à l'exemple pour un éventuel débuggage
+            example = _SQL_EXAMPLES_INDEX["examples"][index].copy()
+            example["score"] = float(score)  # Conversion pour la sérialisation JSON
+            top_examples.append(example)
+
     return {"examples": top_examples}
+
+def get_full_context_for_sql(question: str) -> Dict[str, Any]:
+    """
+    Rassemble TOUT le contexte nécessaire pour l'agent SQL : le schéma et les exemples RAG.
+    """
+    logging.info("Début de la collecte de contexte complet (schéma + exemples)...")
+    
+    # Appel 1: Obtenir le contexte du schéma
+    schema_context = get_full_schema_context()
+    
+    # Appel 2: Obtenir les exemples pertinents
+    examples_context = rag_sql_examples(question=question)
+    
+    # Fusionner les deux dictionnaires en un seul objet de contexte
+    full_context = {**schema_context, **examples_context}
+    
+    logging.info("Contexte complet collecté.")
+    return full_context
+
+def pick_example_sql(question: str, min_score: float = 0.80) -> Optional[str]:
+    """
+    Recherche un exemple SQL avec un score élevé pour la question donnée.
+    Si trouvé, retourne directement la requête SQL de l'exemple.
+    """
+    ex = rag_sql_examples(question, top_k=1, similarity_threshold=min_score).get("examples", [])
+    if not ex:
+        return None
+    sql = ex[0].get("sql") or ex[0].get("query") or ex[0].get("sql_query")
+    if not sql:
+        return None
+    logging.info(f"Exemple SQL trouvé avec score {ex[0].get('score', 0):.3f} : utilisation directe")
+    return sql
+
+def run_sql_with_examples_first(question: str) -> Dict[str, Any]:
+    """
+    1) Essaie l'exemple (si score élevé) -> run_sql(sql_exemple)
+    2) Sinon, retourne une erreur spéciale pour indiquer qu'il faut passer par le LLM
+    """
+    sql = pick_example_sql(question)
+    if sql:
+        result = run_sql(sql)
+        if "error" not in result:
+            # Ajouter des métadonnées pour indiquer qu'on a utilisé un exemple
+            result["used_example"] = True
+            result["sql_used"] = sql
+        return result
+    return {"error": "NO_EXAMPLE"}  # Signal pour utiliser sql_agent
 
 def run_sql(query: str) -> Dict[str, Any]:
     """Exécute une requête SQL SELECT-only sur BigQuery en qualifiant intelligemment les tables."""
@@ -434,24 +589,23 @@ def run_sql(query: str) -> Dict[str, Any]:
     if match := re.compile(r"^\s*```(?:sql)?\s*([\s\S]*?)\s*```\s*$", re.IGNORECASE).match(query): query = match.group(1)
     final_query = query.strip()
 
-    if not re.compile(r"^\s*SELECT\b", re.IGNORECASE).search(final_query):
-        return {"error": "Seules les requêtes SELECT sont autorisées."}
+    if not re.compile(r"^\s*(SELECT|WITH)\b", re.IGNORECASE).search(final_query):
+        return {"error": "Seules les requêtes commençant par SELECT ou WITH sont autorisées."}
 
     # Remplacement intelligent : n'ajoute le préfixe que si la table n'est pas déjà qualifiée.
-    def qualify_table_names(q: str) -> str:
+    def qualify_table_names(q: str, cte_names: set[str]) -> str:
         """
-        Qualifie uniquement les identifiants de table après FROM/JOIN.
+        Qualifie uniquement les tables physiques après FROM/JOIN.
         Cas gérés :
           - table
           - dataset.table
           - project-with-dash.dataset.table
           - déjà backtické : `project.dataset.table`
         Ne touche pas aux fonctions ni sous-requêtes.
+        Ignore :
+          - les sous-requêtes (token suivi de '(')
+          - les CTE (détectés via _extract_cte_names)
         """
-        # Capture :
-        # 1) `...` (déjà backtiqué)
-        # 2) project/dataset/table alphanum + '_' + '-' (pour le project)
-        #    avec 0 à 2 segments '.'
         pattern = r"\b(FROM|JOIN)\s+(?:\n|\r|\s)*(`[^`]+`|[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_]+){0,2})(?!\s*\()"
 
         def normalize(name: str) -> str:
@@ -459,9 +613,14 @@ def run_sql(query: str) -> Dict[str, Any]:
                 name = name[1:-1]
             return name.strip()
 
-        def repl(m):
+        def repl(m: re.Match) -> str:
             kw = m.group(1)
             token = normalize(m.group(2))
+            # Si le token correspond à un CTE → ne pas qualifier
+            # (on compare en lower pour être tolérant à la casse)
+            if token.lower() in cte_names:
+                return f"{kw} {token}"
+
             parts = token.split(".")
             # Si on a déjà project.dataset.table → on ne touche pas
             if len(parts) == 3:
@@ -474,7 +633,7 @@ def run_sql(query: str) -> Dict[str, Any]:
             if len(parts) == 1:
                 tbl = parts[0]
                 return f"{kw} `{PROJECT}.{DATASET}.{tbl}`"
-            # fallback parano
+            # fallback
             return f"{kw} `{token}`"
 
         return re.sub(pattern, repl, q, flags=re.IGNORECASE)
@@ -491,9 +650,26 @@ def run_sql(query: str) -> Dict[str, Any]:
     # Appliquer la qualification uniquement si l'agent a "oublié" le nom complet
     # On vérifie la présence du nom du projet dans la requête pour décider.
 
-    final_query = qualify_table_names(final_query)
+    cte_names = _extract_cte_names(final_query)       
+    final_query = qualify_table_names(final_query, cte_names)
     final_query = backtick_3part_with_project(final_query)
     final_query = _sanitize_functions(final_query)
+
+    # Filet de sécurité : si, malgré tout, un CTE a été backtické/qualifié, on le remet nu.
+    if cte_names:
+        def _dequalify_cte(m: re.Match) -> str:
+            kw, token = m.group(1), m.group(2)
+            tok_norm = token.strip("`")
+            if tok_norm.split(".")[0].lower() in cte_names or tok_norm.lower() in cte_names:
+                return f"{kw} {tok_norm.split('.')[-1]}"
+            return m.group(0)
+
+        final_query = re.sub(
+            r"\b(FROM|JOIN)\s+(`[^`]+`|[A-Za-z0-9_.-]+)",
+            _dequalify_cte,
+            final_query,
+            flags=re.IGNORECASE
+        )
     
     client = _bq_client()
     if not client: return {"error": "Client BigQuery non disponible."}
@@ -515,59 +691,104 @@ def run_sql(query: str) -> Dict[str, Any]:
         logging.error(f"Échec du job SQL : {e} sur la requête : {final_query}")
         return {"error": f"Erreur lors de l'exécution de la requête : {str(e)}"}
     
-def chart_spec(data_json: str, user_intent: str) -> Dict[str, Any]:
+async def chart_spec_tool(data_json: str, user_intent: str, *_, **kwargs) -> Dict[str, Any]:
     """
-    Génére une spec Vega-Lite à partir de data JSON (list[dict]) et de l'intention utilisateur.
-    - Détecte x/y automatiquement (numérique vs texte/date)
-    - Met 'temporal' si la colonne ressemble à une date
-    - 'line' si l'intent suggère une évolution, sinon 'bar'
-    Retour: { "vega_lite_spec": "<json pretty>" } ou { "spec": "<message d'erreur>" }
-    """    
+    Génère une spec Vega-Lite à partir de données et enregistre l'image + la spec
+    comme artifacts ADK via ToolContext. Retourne un petit texte.
+    """
+    import json
+    # 1) Parse data
     try:
         data = json.loads(data_json)
         if not isinstance(data, list) or not data:
-            return {"error": "Données invalides ou vides."}
+            return {"text": "Données vides ou invalides pour le graphique."}
     except json.JSONDecodeError:
-        return {"error": "JSON invalide."}
+        return {"text": "JSON invalide."}
 
-    # Heuristiques pour nommer X/Y
     sample = data[0]
     cols = list(sample.keys())
+    intent = (user_intent or "").lower()
 
-    # Si la métrique attendue est claire dans la question
-    intent = user_intent.lower()
-    y_pref = None
-    if "quantité" in intent:
-        y_pref = "quantite_vendue"
-    elif "chiffre" in intent or "ca" in intent:
-        y_pref = "chiffre_affaires"
+    # Candidats label (x) par priorité
+    x_priority = [
+        "libelle_modele", "libellé_modèle", "ville", "ville_magasin",
+        "famille", "ligne", "id_modele", "id_modèle", "magasin", "boutique",
+    ]
 
-    # Choisir y: métrique numérique
-    numeric_cols = [c for c in cols if isinstance(sample[c], (int, float))]
-    if y_pref and y_pref in cols:
-        y_field = y_pref
-    else:
-        y_field = numeric_cols[0] if numeric_cols else cols[1]
+    # Candidats métriques (y) par priorité / alias
+    y_alias_groups = [
+        ("ca", "chiffre_affaires", "chiffre", "revenue", "sales"),
+        ("quantite_vendue", "quantité", "quantite", "qty", "qte"),
+        ("panier_moyen", "basket", "avg_basket"),
+    ]
 
-    # Choisir x: label catégoriel
-    label_cols = [c for c in cols if isinstance(sample[c], str)]
-    # quelques colonnes courantes en priorité
-    for cand in ["LIBELLE_MODELE", "VILLE", "FAMILLE", "ID_MODELE"]:
-        if cand in cols:
-            x_field = cand
+    # Si l'intention mentionne clairement une métrique, forcer l’ordre
+    if any(k in intent for k in ["chiffre", "ca", "revenue", "vente", "ventes"]):
+        y_alias_groups = [
+            ("ca", "chiffre_affaires", "chiffre", "revenue", "sales"),
+            ("quantite_vendue", "quantité", "quantite", "qty", "qte"),
+            ("panier_moyen",),
+        ]
+    elif any(k in intent for k in ["quantité", "quantite", "qty", "qte"]):
+        y_alias_groups = [
+            ("quantite_vendue", "quantité", "quantite", "qty", "qte"),
+            ("ca", "chiffre_affaires", "chiffre", "revenue", "sales"),
+            ("panier_moyen",),
+        ]
+
+    # Détection types
+    numeric_cols = [c for c in cols_original if isinstance(sample[c], (int, float))]
+    text_cols    = [c for c in cols_original if isinstance(sample[c], str)]
+
+    # Exclure les IDs/codes des candidats métriques
+    def looks_like_id(name: str) -> bool:
+        n = name.lower()
+        return (
+            n.startswith("id_") or
+            n.startswith("code_") or
+            n.startswith("num_") or
+            re.fullmatch(r"(id|code|num(?:ero)?)", n or "") is not None
+        )
+    metric_candidates = [c for c in numeric_cols if not looks_like_id(c)]
+
+    # Choix du y_field via alias, sinon 1er numérique non-ID
+    y_field = None
+    for group in y_alias_groups:
+        col = has_col(*group)
+        if col and col in metric_candidates:
+            y_field = col
             break
-    else:
-        x_field = label_cols[0] if label_cols else cols[0]
+    if not y_field:
+        # fallback : s'il y a 'ca' présent mais filtré par l'heuristique, autoriser
+        ca_like = has_col("ca", "chiffre_affaires")
+        if ca_like and ca_like in numeric_cols:
+            y_field = ca_like
+        elif metric_candidates:
+            y_field = metric_candidates[0]
+        elif numeric_cols:
+            y_field = numeric_cols[-1]  # dernier recours
 
-    mark = "line" if any(k in intent for k in ["évolution","tendance","courbe","over time"]) else "bar"
+    # Choix du x_field via priorité, sinon 1ère string
+    x_field = None
+    for pref in x_priority:
+        col = has_col(pref)
+        if col and col in text_cols:
+            x_field = col
+            break
+    if not x_field:
+        x_field = text_cols[0] if text_cols else cols_original[0]
 
+    # Type de mark
+    mark_type = "line" if any(k in intent for k in ["évolution", "evolution", "tendance", "over time"]) else "bar"
+
+    # Spec Vega-Lite
     spec = {
         "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
         "data": {"values": data},
         "transform": [
             {"calculate": f"isValid(datum['{x_field}']) ? datum['{x_field}'] : 'Non renseigné'", "as": f"{x_field}_label"}
         ],
-        "mark": {"type": mark, "tooltip": True},
+        "mark": {"type": mark_type, "tooltip": True},
         "encoding": {
             "x": {"field": f"{x_field}_label", "type": "nominal", "axis": {"labelAngle": -45}},
             "y": {"field": y_field, "type": "quantitative"},
@@ -575,13 +796,47 @@ def chart_spec(data_json: str, user_intent: str) -> Dict[str, Any]:
         "config": {"axis": {"labelFontSize": 12, "titleFontSize": 12}},
     }
 
-    # Si bar chart catégoriel, trier par la métrique
-    if mark == "bar":
+    if mark_type == "bar":
         spec["encoding"]["x"]["sort"] = f"-{y_field}"
-        spec["width"] = 900  # confortable
+        spec["width"] = 900
         spec["height"] = 450
 
-    return {"vega_lite_spec": spec}
+    # Render to PNG (fallback to SVG)
+    png_bytes = None
+    svg_text = None
+    try:
+        from vl_convert import vl_convert as vlc
+        try:
+            png_bytes = vlc.vegalite_to_png(spec)
+        except Exception:
+            svg_text = vlc.vegalite_to_svg(spec)
+    except Exception:
+        try:
+            from vl_convert import VegaLite
+            try:
+                png_bytes = VegaLite(spec).png()
+            except Exception:
+                svg_text = VegaLite(spec).svg()
+        except Exception:
+            pass
+
+    # Save artifacts via ToolContext (Part); retrieve injected context
+    context = kwargs.get("context") or kwargs.get("tool_context") or kwargs.get("_context")
+    if context is not None:
+        if png_bytes:
+            img_part = genai_types.Part.from_bytes(data=png_bytes, mime_type="image/png")
+            await context.save_artifact(filename="graphique.png", artifact=img_part)
+        elif svg_text:
+            svg_part = genai_types.Part.from_bytes(data=svg_text.encode("utf-8"), mime_type="image/svg+xml")
+            await context.save_artifact(filename="graphique.svg", artifact=svg_part)
+
+        spec_part = genai_types.Part.from_bytes(
+            data=json.dumps(spec, ensure_ascii=False, indent=2).encode("utf-8"),
+            mime_type="application/json"
+        )
+        await context.save_artifact(filename="graphique.spec.vega-lite.json", artifact=spec_part)
+
+    return {"text": "Voici le graphique."}
 
 
 
@@ -619,11 +874,13 @@ def render_vega_block(viz_out: Dict[str, Any]) -> Dict[str, str]:
     return {"text": text}
 
 # Matérialiser les annotations des fonctions exposées comme tools
-#_materialize_annotations(find_relevant_schema)
 _materialize_annotations(get_full_schema_context) 
 _materialize_annotations(rag_sql_examples)
+_materialize_annotations(get_full_context_for_sql)
+_materialize_annotations(pick_example_sql)
+_materialize_annotations(run_sql_with_examples_first)
 _materialize_annotations(run_sql)
-_materialize_annotations(chart_spec)
+_materialize_annotations(chart_spec_tool)
 _materialize_annotations(render_vega_block)
 
 # --- Définitions des Agents ---
@@ -643,61 +900,93 @@ ux_agent = LlmAgent(
     description="Clarifie les questions vagues des utilisateurs.",
     instruction=(
         "Ta tâche est de reformuler la question de l'utilisateur ou de poser une question de clarification si elle est trop vague. "
-        "Sois concis. Ne réponds qu'avec la clarification."
+        "Sois concis. Ne réponds au root_agent qu'avec la clarification."
     ),
 )
 
 metadata_agent = LlmAgent(
     name="metadata_agent",
     model=MODEL,
-    description="Trouve les tables et colonnes pertinentes pour une question.",
+    description="Spécialiste du schéma de la base de données. Fournit la structure des tables, les colonnes et les relations.",
     instruction=(
         "Ta sortie sert UNIQUEMENT de contexte pour d'autres agents.\n"
-        "1) Utilise STRICTEMENT l’outil `find_relevant_schema(question=<question>)`.\n"
-        "2) Renvoie EXACTEMENT l’objet JSON retourné par l’outil, SANS aucun autre texte.\n"
+        "1) Utilise STRICTEMENT l’outil `get_full_context_for_sql(question=<question>)`.\n"
+        "2) Renvoie EXACTEMENT l’objet JSON retourné par l’outil à root_agent via transfer_to_agent, SANS aucun autre texte.\n"
         "3) Tu ne t’adresses JAMAIS à l’utilisateur."
     ),
-    #tools=[find_relevant_schema],
-    tools=[get_full_schema_context],
+    tools=[get_full_context_for_sql],
 )
 
 
 sql_agent = LlmAgent(
-    name="sql_agent", model=MODEL,
-    description="Génère et exécute une requête SQL pour répondre à une question, en se basant sur un contexte de schéma.",
+    name="sql_agent",
+    model=MODEL,
+    description="Génère et exécute une requête SQL en utilisant un contexte fourni.",
     instruction=(
-         "Tu es un worker technique.\n"
-        "• NE T'ADRESSE JAMAIS à l'utilisateur.\n"
-        "• Génère UNE requête SELECT BigQuery (règles ci-dessous), exécute-la via l'outil `run_sql`.\n"
-        "• Quand tu as le résultat (ou une erreur), APPELLE `transfer_to_agent` vers "
-        "`root_agent_reine_des_maracas` avec un message JSON strictement au format :\n"
-        "{ \"agent\":\"sql_agent\", \"question\": <question>, \"sql\": <ta_requête>, \"run_sql_response\": <sortie_de_run_sql> }\n"
-        "• Ne renvoie AUCUN autre texte.\n"
-        "\n"
-        "Tu es un expert SQL BigQuery.\n"
-        "Tu recevras :\n"
-        "- `question`\n"
-        "- `get_full_schema_context_response` (avec `relevant_tables`, `schema_details`=tables/fields/joins et `business_concepts`)\n"
-        "- `examples`\n"
-        "**RÈGLE ABSOLUE :** Ta requête DOIT qualifier chaque nom de table avec `avisia-training.reine_des_maracas.`. Par exemple : `FROM `avisia-training.reine_des_maracas.ticket_caisse` AS t`.\n"
-        "Règles strictes :\n"
-        "• Utilise les *relations* de `schema_details` pour choisir les JOINs et les clés.\n"
-        "• N’emploie que les colonnes présentes dans `schema_details.tables[*].fields`.\n"
-        "• Si la question correspond à un concept métier, utilise `business_concepts.metrics/dimensions` (expression SQL).\n"
-        "• `DATE_TICKET` est STRING au format DD/MM/YYYY → `SAFE.PARSE_DATE('%d/%m/%Y', t.DATE_TICKET)` pour tout EXTRACT/filtre.\n"
-        "• Toutes les tables doivent être **entièrement qualifiées** `avisia-training.reine_des_maracas.*`.\n"
-        "• Mesure principale alias `ca` et enveloppée par `COALESCE(...,0)`.\n"
-        "**RÈGLES DE ROBUSTESSE SQL (OBLIGATOIRES) :**\n"
-        "✅ **Qualif. complète :** Toutes les tables DOIVENT être qualifiées : `avisia-training.reine_des_maracas.nom_table`.\n"
-        "✅ **Jointures Inclusives :** Utilise systématiquement `LEFT JOIN` en partant de la table de transactions (`ticket_caisse`) pour ne perdre aucune vente, même si les informations associées sont manquantes.\n"
-        "✅ **Filtres sur Texte :** Pour toute comparaison de chaînes de caractères (villes, régions, etc.), rends-la insensible à la casse et aux espaces. Utilise le format `UPPER(TRIM(colonne)) = 'VALEUR_EN_MAJUSCULES'`. Exemple : `WHERE UPPER(TRIM(m.REGIONS)) = 'PARIS'`.\n"
-        "✅ **Filtres sur Booléens (Annulations) :** Pour filtrer les ventes valides, gère les `NULL` potentiels sur les colonnes `ANNULATION` et `ANNULATION_IMMEDIATE`. Utilise `COALESCE(t.ANNULATION, FALSE) = FALSE` au lieu de `NOT t.ANNULATION`.\n"
-        "✅ **Agrégations Sûres :** Enveloppe TOUTES les fonctions d'agrégation (`SUM`, `AVG`, etc.) avec `COALESCE(..., 0)` pour garantir un résultat numérique (`0`) au lieu de `NULL` en l'absence de données. Exemple : `COALESCE(SUM(t.QUANTITE), 0)`.\n"
-        "✅ **Gestion des Dates :** `DATE_TICKET` est une STRING `DD/MM/YYYY`. Utilise toujours `SAFE.PARSE_DATE('%d/%m/%Y', t.DATE_TICKET)` pour les filtres ou les extractions de date.\n"
-        "✅ **Concepts Métier :** Si la question de l'utilisateur correspond à un `business_concepts`, utilise l'expression SQL fournie."
-        "Ensuite, exécute via `run_sql` et renvoie son résultat."
+        """Tu es un worker SQL technique.
+        - Ne t’adresse JAMAIS à l’utilisateur.
+        - Ta mission : générer UNE requête SELECT BigQuery, l’exécuter via l’outil `run_sql`, puis transmettre le résultat à l’agent racine.
+
+        ENTRÉES FOURNIES
+        - `question` (texte en langage naturel)
+        - `get_full_context_for_sql_response` contenant :
+        - `schema_details` (tables, colonnes, relations, business_concepts)
+        - `examples` (requêtes SQL précédemment validées)
+
+        PROCESSUS OBLIGATOIRE
+        1) Analyse la `question` et le contexte.
+        2) Génère UNE requête SQL BigQuery en appliquant la HIERARCHIE DES RÈGLES.
+        3) Exécute la requête via l’outil `run_sql`.
+        4) Appelle `transfer_to_agent` vers `root_agent_reine_des_maracas` avec un UNIQUE message JSON STRICT au format :
+        { "agent":"sql_agent", "question": <question>, "sql": <ta_requête>, "run_sql_response": <sortie_de_run_sql> }
+        5) Ne renvoie AUCUN autre texte, AUCUNE explication.
+
+
+        HIERARCHIE DES RÈGLES
+        PRIORITÉ 1 — EXEMPLES (RÈGLE D’OR)
+        - S’il existe un `example` pertinent dans `examples`, commence par COPIER-COLLER sa requête telle quelle.
+        - Ensuite SEULEMENT, adapte-la aux besoins de la question (filtres, dates, agrégations) en respectant TOUTES les règles techniques ci-dessous.
+        - Ne réinvente jamais une logique complexe si un exemple est fourni.
+
+        PRIORITÉ 2 — RÈGLES TECHNIQUES & MÉTIER
+        - Qualification des tables physiques : toujours utiliser le projet/dataset complet :
+        `avisia-training.reine_des_maracas.<table>` AS alias
+        (Ne qualifie jamais les alias de CTE.)
+        - N’emploie que les colonnes présentes dans `schema_details.tables[*].fields`.
+        - Relations & clés : déduis les JOINs à partir de `schema_details.tables[*].joins`.
+        - Business concepts : si la question correspond à un concept, utilise l’expression SQL fournie dans
+        `business_concepts.metrics` et `business_concepts.dimensions`.
+
+
+
+        RÈGLES DE ROBUSTESSE SQL (OBLIGATOIRES)
+        1) Qualification complète :
+        - TOUTE table doit être entièrement qualifiée : `avisia-training.reine_des_maracas.*`, sauf les tables alias (CTE)
+        2) Jointures inclusives :
+        - Utilise systématiquement `LEFT JOIN` en partant de la table de transactions (`ticket_caisse`) pour ne perdre aucune vente
+        3) Filtres texte (insensibles à la casse/espaces) :
+        - Utilise `UPPER(TRIM(colonne)) = 'VALEUR'`
+        4) Filtres booléens (annulations) :
+        - Utilise `COALESCE(t.ANNULATION, FALSE) = FALSE`
+        - Et, si nécessaire, `COALESCE(t.ANNULATION_IMMEDIATE, FALSE) = FALSE`
+        5) Agrégations sûres :
+        - Enveloppe TOUTES les agrégations dans `COALESCE(..., 0)` pour éviter les NULL
+        - Exemple : `COALESCE(SUM(t.QUANTITE), 0)` ; `COALESCE(AVG(x), 0)`
+        6) Gestion des dates :
+        - `DATE_TICKET` est une STRING au format `DD/MM/YYYY`
+        - Toujours parser : `SAFE.PARSE_DATE('%d/%m/%Y', t.DATE_TICKET)`
+        - Toute comparaison/EXTRACT sur date doit passer par ce parse
+        7) Mesure principale :
+        - Si tu calcules un chiffre d’affaires, alias `ca`, enveloppé par `COALESCE(..., 0)`
+
+        CONTRAINTES DE SORTIE
+        - Exécute la requête avec l’outil `run_sql`.
+        - Puis appelle `transfer_to_agent` vers `root_agent_reine_des_maracas` avec EXACTEMENT :
+        { "agent":"sql_agent", "question": <question>, "sql": <ta_requête>, "run_sql_response": <sortie_de_run_sql> }
+        - Ne produis AUCUN autre contenu.
+        """
     ),
-    tools=[rag_sql_examples, run_sql],
+    tools=[run_sql],
 )
 
 
@@ -709,34 +998,39 @@ viz_agent = LlmAgent(
         "Ne t'adresse JAMAIS à l'utilisateur.\n"
         "Tu reçois { data_json, user_intent }.\n"
         "1) Appelle l'outil `chart_spec(data_json=<data_json>, user_intent=<user_intent>)`.\n"
-        "2) Retourne EXCLUSIVEMENT l'objet JSON de sortie de `chart_spec` (sans texte autour)."
+        "2) Le tool sauvegarde l'image en artifact et renvoie un court texte. Renvoie ce texte tel quel."
     ),
-    tools=[chart_spec],
+    tools=[chart_spec_tool],
 )
 
 root_agent = LlmAgent(
     name="root_agent_reine_des_maracas",
     model=MODEL,
-    description=(
-        "Orchestre les agents spécialisés pour répondre aux questions analytiques. "
-        "Après `metadata_agent`, transfert obligatoire vers `sql_agent` via `transfer_to_agent` avec la question, la réponse de schéma et la consigne."
+    description="Orchestre les agents spécialisés pour répondre aux questions analytiques.",
+    
+    # --- AJOUT DU PLANNER ---
+    planner=BuiltInPlanner(
+        thinking_config=genai_types.ThinkingConfig(
+            # On active la réflexion interne du modèle pour suivre le plan
+            include_thoughts=False, 
+        )
     ),
-    instruction=(
-        "Tu es le SEUL agent autorisé à parler à l'utilisateur.\n"
-        "\n"
-        "Flux :\n"
-        "1) Appelle `metadata_agent` pour le contexte.\n"
-        "2) Transfère à `sql_agent` (via `transfer_to_agent`) avec {question, find_relevant_schema_response}.\n"
-        "   Important : Après `metadata_agent`, tu n’adresses JAMAIS de réponse à l’utilisateur avant le retour de `sql_agent`.\n"
-        "   Une fois le transfert effectué, attends la sortie de `sql_agent`.\n"
-        "3) À la réception de la réponse de `sql_agent` (via `transfer_to_agent`), si `run_sql_response.result` contient des lignes :\n"
-        "   - Si la question de l'utilisateur demande un graphique (détecte des mots comme 'graphique', 'courbe', 'barre', 'visualisation', 'évolution', 'tendance'),\n"
-        "     alors transfère à `viz_agent` avec { data_json: run_sql_response.result, user_intent: <question originale> }.\n"
-        "   - Sinon, formate directement la réponse tabulaire pour l'utilisateur.\n"
-        "4) À la réception de `viz_agent` (via `transfer_to_agent`), APPELLE l'outil `render_vega_block(viz_out=<réponse de viz_agent>)` et RENVOIE STRICTEMENT la clé `text` en sortie (sans autre texte).\n"
-        "5) NE JAMAIS afficher les JSON intermédiaires (`metadata_agent`, `viz_agent` brut, etc.).\n"
-        "6) En cas d'erreur dans `run_sql_response` ou `chart`, explique clairement l'erreur.\n"
-        "7) En cas d'ambiguïté, tu peux appeler `ux_agent` pour clarifier la question."
+    # --- FIN DE L'AJOUT ---
+    
+instruction=(
+        "Tu es l'orchestrateur principal et le SEUL à communiquer avec l'utilisateur.\n"
+        "Ton travail consiste à suivre un plan séquentiel en appelant des agents spécialisés. Tu ne dois JAMAIS afficher leurs réponses brutes, qui sont tes notes de travail internes.\n\n"
+        "**PLAN D'ACTION SÉQUENTIEL OBLIGATOIRE :**\n"
+        "1.  **ÉTAPE 1 : Collecte du Schéma et des Exemples SQL.**\n"
+        "    - Appelle `metadata_agent` avec la question initiale pour obtenir le contexte complet.\n"
+        "2.  **ÉTAPE 2 : Génération SQL.**\n"
+        "    - Appelle `sql_agent` en lui passant la question initiale et ce `contexte` combinés.\n"
+        "4.  **ÉTAPE 4 : Synthèse de la Réponse Finale.**\n"
+        "    - Le résultat de l'étape 3 est un objet JSON. Extrais la valeur de la clé `sql_result` pour l'analyse.\n"
+        "    - Si le résultat contient une erreur, explique-la simplement à l'utilisateur.\n"
+        "    - Si l'utilisateur a demandé un graphique et que les données sont valides, appelle `viz_agent` avec les données de `sql_result`.\n"
+        "    - Sinon, formule une réponse finale claire en langage naturel pour l'utilisateur en te basant sur les données de `sql_result`.\n\n"
+        "**Cas particulier :** Si la question initiale est ambiguë, appelle `ux_agent` avant de commencer le plan."
     ),
     tools=[render_vega_block],
     sub_agents=[ux_agent, metadata_agent, sql_agent, viz_agent],
@@ -744,3 +1038,4 @@ root_agent = LlmAgent(
 
 # --- Initialisation au démarrage ---
 _initialize_components()
+_initialize_sql_examples_index()

@@ -6,4 +6,5 @@ __pycache__/
 .env
 .chroma/
 
-historique_deploiement.py
+historique_deploiement.md
+doc_tempo.md
