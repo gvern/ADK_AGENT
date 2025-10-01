@@ -13,18 +13,15 @@ from importlib import resources
 import re
 import json
 import logging
-import asyncio
-from datetime import date, timedelta
 from typing import Any, Dict, List, Optional
 from functools import lru_cache
 from collections import defaultdict
 
 import numpy as np
 from google.cloud import bigquery
-from google.api_core.exceptions import GoogleAPICallError
+from google.api_core.exceptions import GoogleAPICallError, BadRequest, Forbidden
 from google.adk.agents.llm_agent import LlmAgent
-from google.adk.tools import FunctionTool
-from google.adk.tools.tool_context import ToolContext
+from google.adk.planners import BuiltInPlanner
 import google.genai.types as genai_types
 
 # --- Vérification et importation des dépendances ---
@@ -36,7 +33,7 @@ except ImportError:
     VERTEXAI_AVAILABLE = False
 
 # --- Configuration ---
-MODEL = os.getenv("DATA_MODEL", "gemini-2.5-flash")
+MODEL = os.getenv("DATA_MODEL", "gemini-2.5-pro")
 if os.getenv("VERTEX_PROJECT") and not os.getenv("VERTEXAI_PROJECT"):
     os.environ["VERTEXAI_PROJECT"] = os.environ["VERTEX_PROJECT"]
 if os.getenv("VERTEX_LOCATION") and not os.getenv("VERTEXAI_LOCATION"):
@@ -53,21 +50,29 @@ EXAMPLES_PATH = os.getenv(
     "SQL_EXAMPLES_PATH",
     os.path.join(BASE_DIR, "sql_examples.json")
 )
+EXAMPLE_MIN_SCORE = float(os.getenv("EXAMPLE_MIN_SCORE", "0.85"))
 
-logging.basicConfig(level=logging.INFO) 
-logging.info(f"Chemin des exemples SQL utilisé : {EXAMPLES_PATH}")
-logging.info(f"Le fichier existe-t-il ? {'Oui' if os.path.exists(EXAMPLES_PATH) else 'Non'}")
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    logging.basicConfig(level=logging.INFO)
+logger.info(f"Chemin des exemples SQL utilisé : {EXAMPLES_PATH}")
+logger.info(f"Le fichier existe-t-il ? {'Oui' if os.path.exists(EXAMPLES_PATH) else 'Non'}")
+logger.info(f"BQ_LOCATION={os.getenv('BQ_LOCATION')!r} — DATASET={PROJECT}.{DATASET}")
+# Réduire le bruit des warnings aiohttp/asyncio si des librairies externes ne ferment pas proprement
+logging.getLogger("aiohttp.client").setLevel(logging.ERROR)
+logging.getLogger("aiohttp.connector").setLevel(logging.ERROR)
+logging.getLogger("asyncio").setLevel(logging.ERROR)
 
 if VERTEXAI_AVAILABLE:
     try:
         if PROJECT:
             vertexai.init(project=PROJECT, location=LOCATION)
-            logging.info(f"Vertex AI SDK initialized for project '{PROJECT}' in '{LOCATION}'.")
+            logger.info(f"Vertex AI SDK initialized for project '{PROJECT}' in '{LOCATION}'.")
     except Exception as e:
-        logging.warning(f"Could not initialize Vertex AI SDK. Error: {e}")
+        logger.warning(f"Could not initialize Vertex AI SDK. Error: {e}")
         VERTEXAI_AVAILABLE = False
 else:
-    logging.warning("Vertex AI SDK not found. Install 'google-cloud-aiplatform' to enable semantic search.")
+    logger.warning("Vertex AI SDK not found. Install 'google-cloud-aiplatform' to enable semantic search.")
 
 # --- Gestion du Schéma ---
 def _bq_client() -> Optional[bigquery.Client]:
@@ -75,11 +80,17 @@ def _bq_client() -> Optional[bigquery.Client]:
         if not PROJECT: return None
         return bigquery.Client(project=PROJECT, location=os.getenv("BQ_LOCATION"))
     except Exception as e:
-        logging.warning(f"Le client BigQuery n'a pas pu être initialisé : {e}")
+        logger.warning(f"Le client BigQuery n'a pas pu être initialisé : {e}")
         return None
 
 @lru_cache(maxsize=1)
 def get_enriched_schema() -> Dict[str, Any]:
+    # Option d'invalidation du cache à la volée
+    if os.getenv("DISABLE_SCHEMA_CACHE") == "1":
+        try:
+            get_enriched_schema.cache_clear()  # type: ignore[attr-defined]
+        except Exception:
+            pass
     client = _bq_client()
     live_schema: Dict[str, Any] = {"tables": []}
     descriptions = _load_static_descriptions()
@@ -103,9 +114,12 @@ def get_enriched_schema() -> Dict[str, Any]:
                 field_descriptions = {f["name"]: f for f in enriched_table.get("fields", [])}
                 merged_fields = [{**live_field, **field_descriptions.get(live_field["name"], {})} for live_field in table_data["fields"]]
                 live_schema["tables"].append({"name": name, "description": enriched_table.get("description", ""), "fields": merged_fields})
-            logging.info(f"Schéma chargé et enrichi pour {len(live_schema['tables'])} tables.")
-        except GoogleAPICallError as e:
-            logging.warning(f"Échec de la récupération du schéma live : {e}. Utilisation du schéma statique.")
+            logger.info(f"Schéma chargé et enrichi pour {len(live_schema['tables'])} tables.")
+        except (GoogleAPICallError, BadRequest) as e:
+            logger.warning(f"Échec de la récupération du schéma live (Google API): {e}. Utilisation du schéma statique.")
+            return descriptions
+        except Exception as e:
+            logger.warning(f"Échec de la récupération du schéma live (Exception): {e}. Utilisation du schéma statique.")
             return descriptions
     return live_schema
 
@@ -134,20 +148,26 @@ def _load_static_descriptions() -> Dict[str, Any]:
             if p.exists():
                 with open(p, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                logging.info(f"Chargé table_description.json depuis: {p}")
+                logger.info(f"Chargé table_description.json depuis: {p}")
                 return data
         except (IOError, json.JSONDecodeError) as e:
-            logging.warning(f"Échec lecture {p}: {e}")
-    logging.warning("Aucune description statique trouvée. Joins/concepts indisponibles.")
+            logger.warning(f"Échec lecture {p}: {e}")
+    logger.warning("Aucune description statique trouvée. Joins/concepts indisponibles.")
     return {"tables": [], "relations": [], "concepts": {}}
 
 @lru_cache(maxsize=1)
 def _load_sql_examples() -> List[Dict[str, Any]]:
+    # Invalidation du cache à la volée si demandé
+    if os.getenv("DISABLE_EXAMPLES_CACHE") == "1":
+        try:
+            _load_sql_examples.cache_clear()  # type: ignore[attr-defined]
+        except Exception:
+            pass
     try:
         if os.path.exists(EXAMPLES_PATH):
             with open(EXAMPLES_PATH, "r", encoding="utf-8") as f: return json.load(f)
     except (IOError, json.JSONDecodeError) as e:
-        logging.warning(f"Impossible de charger les exemples SQL : {e}")
+        logger.warning(f"Impossible de charger les exemples SQL : {e}")
     return []
 
 # --- Moteur de Recherche Sémantique ---
@@ -160,8 +180,11 @@ class EmbeddingClient:
         try:
             return np.array([e.values for e in self.model.get_embeddings(texts)])
         except Exception as e:
-            logging.error(f"Échec de l'obtention des embeddings : {e}")
+            logger.error(f"Échec de l'obtention des embeddings : {e}")
             return np.zeros((len(texts), 768))
+
+# Client global unique pour éviter les "Unclosed client session"
+_EMBED_CLIENT: Optional[EmbeddingClient] = None
 
 class SemanticIndex:
     def __init__(self, metadata: List[Dict[str, Any]], vectors: np.ndarray, client: EmbeddingClient):
@@ -174,7 +197,7 @@ class SemanticIndex:
         self.normalized_vectors = np.divide(self.vectors, norms, out=np.zeros_like(self.vectors), where=norms!=0)
     @staticmethod
     def create(schema: Dict[str, Any], client: EmbeddingClient) -> "SemanticIndex":
-        logging.info("Construction de l'index sémantique...")
+        logger.info("Construction de l'index sémantique...")
         docs, metadata = [], []
         for table in schema.get("tables", []):
             for field in table.get("fields", []):
@@ -182,7 +205,7 @@ class SemanticIndex:
                 docs.append(doc)
                 metadata.append({"table": table.get('name', ''), "field": field.get('name', '')})
         vectors = client.get_embeddings(docs)
-        logging.info(f"Index sémantique construit avec {len(metadata)} entrées.")
+        logger.info(f"Index sémantique construit avec {len(metadata)} entrées.")
         return SemanticIndex(metadata, vectors, client)
     def search(self, query: str, top_k: int = 10) -> List[Dict[str, Any]]:
         query_vec = self.client.get_embeddings([query])
@@ -202,20 +225,22 @@ _SQL_EXAMPLES_INDEX: Dict[str, Any] = {"examples": [], "vectors": np.array([])}
 
 def _initialize_sql_examples_index():
     """Charge les exemples SQL et pré-calcule leurs embeddings."""
-    global _SQL_EXAMPLES_INDEX
+    global _SQL_EXAMPLES_INDEX, _EMBED_CLIENT
     if not VERTEXAI_AVAILABLE:
-        logging.warning("L'index des exemples SQL ne peut être initialisé car Vertex AI n'est pas dispo.")
+        logger.warning("L'index des exemples SQL ne peut être initialisé car Vertex AI n'est pas dispo.")
         return
 
     examples = _load_sql_examples()
     if not examples:
-        logging.info("Aucun exemple SQL à indexer.")
+        logger.info("Aucun exemple SQL à indexer.")
         return
+
+    if _EMBED_CLIENT is None:
+        _EMBED_CLIENT = EmbeddingClient()
 
     # On ne calcule les embeddings que pour les questions des exemples
     example_questions = [ex['question'] for ex in examples]
-    client = EmbeddingClient() # Réutilise le même client que pour le schéma
-    vectors = client.get_embeddings(example_questions)
+    vectors = _EMBED_CLIENT.get_embeddings(example_questions)
 
     # Normaliser les vecteurs une seule fois pour des calculs de similarité plus rapides
     norms = np.linalg.norm(vectors, axis=1, keepdims=True)
@@ -223,14 +248,15 @@ def _initialize_sql_examples_index():
     
     _SQL_EXAMPLES_INDEX["examples"] = examples
     _SQL_EXAMPLES_INDEX["vectors"] = normalized_vectors # On stocke les vecteurs normalisés
-    logging.info(f"{len(examples)} exemples SQL ont été chargés et vectorisés.")
+    logger.info(f"{len(examples)} exemples SQL ont été chargés et vectorisés.")
 
 def _initialize_components():
-    global _SEMANTIC_INDEX
+    global _SEMANTIC_INDEX, _EMBED_CLIENT
+    if VERTEXAI_AVAILABLE and _EMBED_CLIENT is None:
+        _EMBED_CLIENT = EmbeddingClient()
     if VERTEXAI_AVAILABLE and not _SEMANTIC_INDEX:
-        client = EmbeddingClient()
         schema = get_enriched_schema()
-        _SEMANTIC_INDEX = SemanticIndex.create(schema, client)
+        _SEMANTIC_INDEX = SemanticIndex.create(schema, _EMBED_CLIENT)
 
 # --- Helpers SQL ---
 
@@ -296,6 +322,9 @@ def _sanitize_functions(q: str) -> str:
     # 1) Répare PARSE_DAT`E
     q = re.sub(r"PARSE_DAT`?E", "PARSE_DATE", q, flags=re.IGNORECASE)
 
+    # 1bis) Forcer SAFE.PARSE_DATE si PARSE_DATE nu
+    q = re.sub(r"(?<!SAFE\.)\bPARSE_DATE\s*\(", "SAFE.PARSE_DATE(", q, flags=re.IGNORECASE)
+
     # 2) Retire une qualification projet.* (avec ou sans backticks) placée devant des fonctions connues
     funcs = [
         r"SAFE\.PARSE_DATE", r"SAFE\.PARSE_DATETIME", r"SAFE\.PARSE_TIME",
@@ -308,10 +337,97 @@ def _sanitize_functions(q: str) -> str:
     for f in funcs:
         q = re.sub(rf"`?{proj}\.\`?({f})`?", r"\1", q, flags=re.IGNORECASE)
 
+    # 2bis) Retire une qualification project.dataset.func( … ) si elle s'est glissée (sécurité supplémentaire)
+    q = re.sub(
+        rf"`?{re.escape(PROJECT)}\.`?{re.escape(DATASET)}\.`?(SAFE\.PARSE_DATE|SAFE\.PARSE_DATETIME|SAFE\.PARSE_TIME)`?\(",
+        r"\1(",
+        q,
+        flags=re.IGNORECASE,
+    )
+
     # 3) Backticks orphelins sur les noms de fonctions
     q = re.sub(r"`(EXTRACT|DATE|DATETIME|TIMESTAMP|SAFE)`\s*\(", r"\1(", q, flags=re.IGNORECASE)
 
     return q
+
+def _wrap_date_ticket_best_effort(q: str) -> str:
+    """Enveloppe DATE_TICKET par SAFE.PARSE_DATE uniquement dans des contextes de comparaison usuels.
+    Évite de toucher aux alias, chaînes, ou autres occurrences non pertinentes.
+    """
+    # Cas 1: DATE_TICKET <op> ...  où <op> ∈ {<=, >=, !=, =, <, >}
+    q = re.sub(
+        r"(\bDATE_TICKET\b)\s*(<=|>=|!=|=|<|>)",
+        lambda m: f"SAFE.PARSE_DATE('%d/%m/%Y', DATE_TICKET){m.group(2)}",
+        q,
+        flags=re.IGNORECASE,
+    )
+
+    # Cas 2: ... <op> DATE_TICKET
+    q = re.sub(
+        r"(<=|>=|!=|=|<|>)\s*(\bDATE_TICKET\b)",
+        lambda m: f"{m.group(1)}SAFE.PARSE_DATE('%d/%m/%Y', DATE_TICKET)",
+        q,
+        flags=re.IGNORECASE,
+    )
+
+    # Cas 3: BETWEEN x AND DATE_TICKET
+    q = re.sub(
+        r"\bBETWEEN\s+([^\s]+)\s+AND\s+(\bDATE_TICKET\b)",
+        lambda m: f"BETWEEN {m.group(1)} AND SAFE.PARSE_DATE('%d/%m/%Y', DATE_TICKET)",
+        q,
+        flags=re.IGNORECASE,
+    )
+
+    # Cas 4: DATE_TICKET BETWEEN x AND y
+    q = re.sub(
+        r"(\bDATE_TICKET\b)\s+BETWEEN\s+([^\s]+)\s+AND\s+([^\s]+)",
+        lambda m: f"SAFE.PARSE_DATE('%d/%m/%Y', DATE_TICKET) BETWEEN {m.group(2)} AND {m.group(3)}",
+        q,
+        flags=re.IGNORECASE,
+    )
+
+    return q
+
+def _retarget_project_dataset(sql: str) -> str:
+    """
+    Remplace les références 3-parties par le triplet actuel `PROJECT.DATASET.table`.
+    - Respecte les identifiants backtickés.
+    - Pour les non-backtickés, NE modifie pas l'intérieur des chaînes (simples/doubles)
+      et évite les appels de fonctions de type proj.dataset.func( grâce à un lookahead simple.
+    """
+    # 1) Backtickés
+    sql = re.sub(
+        r"`([A-Za-z0-9_-]+)\.([A-Za-z_]\w*)\.([A-Za-z_]\w*)`",
+        rf"`{PROJECT}.{DATASET}.\3`",
+        sql,
+    )
+    # 2) Non backtickés, hors quotes et hors appels de fonctions proj.ds.func(
+    parts, out, in_s, in_d = [], [], False, False
+    i = 0
+    while i < len(sql):
+        c = sql[i]
+        if c == "'" and not in_d:
+            in_s = not in_s
+            out.append(c)
+            i += 1
+            continue
+        if c == '"' and not in_s:
+            in_d = not in_d
+            out.append(c)
+            i += 1
+            continue
+        if in_s or in_d:
+            out.append(c)
+            i += 1
+            continue
+        m = re.match(r"\b([A-Za-z0-9_-]+)\.([A-Za-z_]\w*)\.([A-Za-z_]\w*)\b(?!\s*\()", sql[i:])
+        if m:
+            out.append(f"{PROJECT}.{DATASET}.{m.group(3)}")
+            i += m.end()
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
 
 # --- Outils pour les Agents ---
 #def find_relevant_schema(question: str) -> Dict[str, Any]:
@@ -496,15 +612,11 @@ def rag_sql_examples(question: str, top_k: int = 3, similarity_threshold: float 
     Récupère des exemples de questions-SQL similaires à la question de l'utilisateur
     en utilisant des embeddings pré-calculés.
     """
-    if not _SQL_EXAMPLES_INDEX["examples"]:
+    if not _SQL_EXAMPLES_INDEX["examples"] or not VERTEXAI_AVAILABLE or _EMBED_CLIENT is None:
         return {"examples": []}
 
     # 1. Calculer l'embedding UNIQUEMENT pour la nouvelle question
-    if not VERTEXAI_AVAILABLE:
-        return {"examples": []}
-    
-    client = EmbeddingClient()
-    query_vec = client.get_embeddings([question])
+    query_vec = _EMBED_CLIENT.get_embeddings([question])
     
     # Gérer le cas où l'embedding échoue
     if query_vec.size == 0:
@@ -531,14 +643,21 @@ def rag_sql_examples(question: str, top_k: int = 3, similarity_threshold: float 
             example = _SQL_EXAMPLES_INDEX["examples"][index].copy()
             example["score"] = float(score)  # Conversion pour la sérialisation JSON
             top_examples.append(example)
+            # Log quand un exemple est trouvé avec un score supérieur au seuil
+            logger.info(f"Exemple trouvé avec score {score:.3f} (seuil: {similarity_threshold}) - Question: '{example.get('question', 'N/A')}, query: {example.get('sql', example.get('query', example.get('sql_query', 'N/A')))}'")
+        elif score >= similarity_threshold:
+            # Log également les exemples qui dépassent le seuil mais ne sont pas retenus (limite top_k atteinte)
+            logger.debug(f"Exemple avec score {score:.3f} ignoré (limite top_k={top_k} atteinte)")
+            break  # Comme la liste est triée, les suivants auront des scores plus faibles
 
     return {"examples": top_examples}
 
 def get_full_context_for_sql(question: str) -> Dict[str, Any]:
     """
-    Rassemble TOUT le contexte nécessaire pour l'agent SQL : le schéma et les exemples RAG.
+    Rassemble TOUT le contexte nécessaire pour l'agent SQL : le schéma, les exemples RAG,
+    et OPTIONNELLEMENT un exemple prioritaire retargeté si le score est très élevé.
     """
-    logging.info("Début de la collecte de contexte complet (schéma + exemples)...")
+    logger.info("Début de la collecte de contexte complet (schéma + exemples)...")
     
     # Appel 1: Obtenir le contexte du schéma
     schema_context = get_full_schema_context()
@@ -546,44 +665,38 @@ def get_full_context_for_sql(question: str) -> Dict[str, Any]:
     # Appel 2: Obtenir les exemples pertinents
     examples_context = rag_sql_examples(question=question)
     
-    # Fusionner les deux dictionnaires en un seul objet de contexte
-    full_context = {**schema_context, **examples_context}
+    # Appel 3: Vérifier s'il y a un exemple très pertinent à privilégier
+    priority_example = None
+    if examples_context.get("examples"):
+        top_example = examples_context["examples"][0]
+        if top_example.get("score", 0) >= EXAMPLE_MIN_SCORE:
+            # Retargeter l'exemple vers le bon projet/dataset
+            original_sql = top_example.get("sql") or top_example.get("query") or top_example.get("sql_query")
+            if original_sql:
+                retargeted_sql = _retarget_project_dataset(original_sql)
+                cleaned_sql = _sanitize_functions(retargeted_sql)
+                priority_example = {
+                    **top_example,
+                    "sql_retargeted": cleaned_sql,
+                    "is_priority": True
+                }
+                logger.info(f"Exemple prioritaire retenu (score {top_example.get('score', 0):.3f} >= {EXAMPLE_MIN_SCORE:.2f}) et retargeté.")
     
-    logging.info("Contexte complet collecté.")
+    # Fusionner les dictionnaires en un seul objet de contexte
+    full_context = {**schema_context, **examples_context}
+    if priority_example:
+        full_context["priority_example"] = priority_example
+    
+    logger.info("Contexte complet collecté.")
     return full_context
 
-def pick_example_sql(question: str, min_score: float = 0.80) -> Optional[str]:
-    """
-    Recherche un exemple SQL avec un score élevé pour la question donnée.
-    Si trouvé, retourne directement la requête SQL de l'exemple.
-    """
-    ex = rag_sql_examples(question, top_k=1, similarity_threshold=min_score).get("examples", [])
-    if not ex:
-        return None
-    sql = ex[0].get("sql") or ex[0].get("query") or ex[0].get("sql_query")
-    if not sql:
-        return None
-    logging.info(f"Exemple SQL trouvé avec score {ex[0].get('score', 0):.3f} : utilisation directe")
-    return sql
-
-def run_sql_with_examples_first(question: str) -> Dict[str, Any]:
-    """
-    1) Essaie l'exemple (si score élevé) -> run_sql(sql_exemple)
-    2) Sinon, retourne une erreur spéciale pour indiquer qu'il faut passer par le LLM
-    """
-    sql = pick_example_sql(question)
-    if sql:
-        result = run_sql(sql)
-        if "error" not in result:
-            # Ajouter des métadonnées pour indiquer qu'on a utilisé un exemple
-            result["used_example"] = True
-            result["sql_used"] = sql
-        return result
-    return {"error": "NO_EXAMPLE"}  # Signal pour utiliser sql_agent
 
 def run_sql(query: str) -> Dict[str, Any]:
     """Exécute une requête SQL SELECT-only sur BigQuery en qualifiant intelligemment les tables."""
     if not query: return {"error": "Requête vide reçue."}
+
+    # ✅ NEW: retarget tôt toute écriture 3-parties (avec/sans backticks)
+    query = _retarget_project_dataset(query)
     
     # Nettoyage initial
     if match := re.compile(r"^\s*```(?:sql)?\s*([\s\S]*?)\s*```\s*$", re.IGNORECASE).match(query): query = match.group(1)
@@ -643,7 +756,7 @@ def run_sql(query: str) -> Dict[str, Any]:
     def backtick_3part_with_project(q: str) -> str:
         proj = re.escape(PROJECT)  # gère le tiret
         # autorise ds et table non quotés (letters/digits/_), pas d’espaces
-        pat = rf"(?<!`)({proj}\.[A-Za-z_]\w*\.[A-Za-z_]\w*)(?!`)"
+        pat = rf"(?<!`)\b({proj}\.[A-Za-z_]\w*\.[A-Za-z_]\w*)\b(?!\s*\(|\.)"
         return re.sub(pat, r"`\1`", q)
 
 
@@ -653,6 +766,7 @@ def run_sql(query: str) -> Dict[str, Any]:
     cte_names = _extract_cte_names(final_query)       
     final_query = qualify_table_names(final_query, cte_names)
     final_query = backtick_3part_with_project(final_query)
+    final_query = _wrap_date_ticket_best_effort(final_query)
     final_query = _sanitize_functions(final_query)
 
     # Filet de sécurité : si, malgré tout, un CTE a été backtické/qualifié, on le remet nu.
@@ -665,7 +779,7 @@ def run_sql(query: str) -> Dict[str, Any]:
             return m.group(0)
 
         final_query = re.sub(
-            r"\b(FROM|JOIN)\s+(`[^`]+`|[A-Za-z0-9_.-]+)",
+            r"\b(FROM|JOIN)\s+(`[^`]+`|[A-Za-z0-9_.-]+)(?!\s*\()",
             _dequalify_cte,
             final_query,
             flags=re.IGNORECASE
@@ -675,83 +789,100 @@ def run_sql(query: str) -> Dict[str, Any]:
     if not client: return {"error": "Client BigQuery non disponible."}
     
     try:
-        logging.info(f"Final SQL:\n{final_query}")
+        logger.info(f"Final SQL:\n{final_query}")
         job = client.query(final_query, location=os.getenv("BQ_LOCATION"))
-        rows_iter = job.result(max_results=1000)
-        
-        cols = [sf.name for sf in rows_iter.schema]
-        rows = [list(row.values()) for row in rows_iter]
+        rows_iter = job.result(timeout=120)          # attend la fin avec un timeout
+        rows       = list(rows_iter)[:1000]          # coupe côté client
+        logger.info(f"Rows fetched (capped): {len(rows)}")
+        cols       = [sf.name for sf in rows_iter.schema]
 
         if not rows: return {"result": "La requête a fonctionné mais n'a retourné aucune ligne."}
-        
-        data = [{col: row[i] for i, col in enumerate(cols)} for row in rows]
+            
+        # Mappe chaque ligne en dict en s'appuyant sur l'ordre des colonnes
+        data = [dict(zip(cols, list(row.values()))) for row in rows]
         return {"result": json.dumps(data, indent=2, default=str)}
 
+    except BadRequest as e:
+        return {"error": f"Requête invalide BigQuery: {getattr(e, 'message', str(e))}"}
+    except Forbidden as e:
+        bq_loc = os.getenv("BQ_LOCATION")
+        logger.error(f"Forbidden BigQuery on {PROJECT}.{DATASET} (BQ_LOCATION={bq_loc!r}): {e}")
+        return {"error": f"Accès BigQuery refusé sur {PROJECT}.{DATASET} (BQ_LOCATION={bq_loc!r}). Vérifier permissions/ACLs et la région du job."}
     except Exception as e:
-        logging.error(f"Échec du job SQL : {e} sur la requête : {final_query}")
+        logger.error(f"Échec du job SQL : {e} sur la requête : {final_query}")
         return {"error": f"Erreur lors de l'exécution de la requête : {str(e)}"}
     
 async def chart_spec_tool(data_json: str, user_intent: str, *_, **kwargs) -> Dict[str, Any]:
     """
-    Génère une spec Vega-Lite à partir de données et enregistre l'image + la spec
-    comme artifacts ADK via ToolContext. Retourne un petit texte.
+    Génère une spec Vega-Lite à partir de données (list[dict]) et enregistre :
+      - l'image (PNG si possible, sinon SVG)
+      - la spec JSON
+    comme Artifacts ADK (bytes).
+    Retourne {"text": "..."} pour le root.
     """
     import json
-    # 1) Parse data
+    import unicodedata
+
+    # -- 1) Parse & garde-fous --
     try:
-        data = json.loads(data_json)
-        if not isinstance(data, list) or not data:
-            return {"text": "Données vides ou invalides pour le graphique."}
+      data = json.loads(data_json)
+      if not isinstance(data, list) or not data:
+          return {"text": "Données vides ou invalides pour le graphique."}
     except json.JSONDecodeError:
-        return {"text": "JSON invalide."}
+      return {"text": "JSON invalide."}
 
     sample = data[0]
     cols = list(sample.keys())
     intent = (user_intent or "").lower()
 
-    # Candidats label (x) par priorité
+    # -- 2) Normalisation colonnes pour matching tolérant --
+    def _norm(s: str) -> str:
+        s2 = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
+        return s2.lower().strip()
+
+    col_norm_map = {_norm(c): c for c in cols}  # "ville" -> "VILLE" (original)
+    def has_col(*candidates: str) -> Optional[str]:
+        for cand in candidates:
+            real = col_norm_map.get(_norm(cand))
+            if real is not None:
+                return real
+        return None
+
+    # -- 3) Heuristiques ID & types --
+    def looks_like_id(name: str) -> bool:
+        n = _norm(name)
+        return n.startswith(("id_", "code_", "num_")) or n in {"id", "code", "num", "numero", "code_boutique"}
+
+    numeric_cols = [c for c in cols if isinstance(sample.get(c), (int, float))]
+    text_cols    = [c for c in cols if isinstance(sample.get(c), str)]
+
+    # -- 4) Alias & priorités (robustes à la casse/accents) --
     x_priority = [
         "libelle_modele", "libellé_modèle", "ville", "ville_magasin",
         "famille", "ligne", "id_modele", "id_modèle", "magasin", "boutique",
     ]
 
-    # Candidats métriques (y) par priorité / alias
     y_alias_groups = [
         ("ca", "chiffre_affaires", "chiffre", "revenue", "sales"),
         ("quantite_vendue", "quantité", "quantite", "qty", "qte"),
         ("panier_moyen", "basket", "avg_basket"),
     ]
-
-    # Si l'intention mentionne clairement une métrique, forcer l’ordre
     if any(k in intent for k in ["chiffre", "ca", "revenue", "vente", "ventes"]):
         y_alias_groups = [
             ("ca", "chiffre_affaires", "chiffre", "revenue", "sales"),
             ("quantite_vendue", "quantité", "quantite", "qty", "qte"),
-            ("panier_moyen",),
+            ("panier_moyen", "basket", "avg_basket"),
         ]
     elif any(k in intent for k in ["quantité", "quantite", "qty", "qte"]):
         y_alias_groups = [
             ("quantite_vendue", "quantité", "quantite", "qty", "qte"),
             ("ca", "chiffre_affaires", "chiffre", "revenue", "sales"),
-            ("panier_moyen",),
+            ("panier_moyen", "basket", "avg_basket"),
         ]
 
-    # Détection types
-    numeric_cols = [c for c in cols_original if isinstance(sample[c], (int, float))]
-    text_cols    = [c for c in cols_original if isinstance(sample[c], str)]
-
-    # Exclure les IDs/codes des candidats métriques
-    def looks_like_id(name: str) -> bool:
-        n = name.lower()
-        return (
-            n.startswith("id_") or
-            n.startswith("code_") or
-            n.startswith("num_") or
-            re.fullmatch(r"(id|code|num(?:ero)?)", n or "") is not None
-        )
     metric_candidates = [c for c in numeric_cols if not looks_like_id(c)]
 
-    # Choix du y_field via alias, sinon 1er numérique non-ID
+    # -- 5) Choix Y --
     y_field = None
     for group in y_alias_groups:
         col = has_col(*group)
@@ -759,16 +890,17 @@ async def chart_spec_tool(data_json: str, user_intent: str, *_, **kwargs) -> Dic
             y_field = col
             break
     if not y_field:
-        # fallback : s'il y a 'ca' présent mais filtré par l'heuristique, autoriser
         ca_like = has_col("ca", "chiffre_affaires")
         if ca_like and ca_like in numeric_cols:
             y_field = ca_like
         elif metric_candidates:
             y_field = metric_candidates[0]
         elif numeric_cols:
-            y_field = numeric_cols[-1]  # dernier recours
+            y_field = numeric_cols[0]
+        else:
+            return {"text": "Aucune métrique numérique détectée pour un graphique."}
 
-    # Choix du x_field via priorité, sinon 1ère string
+    # -- 6) Choix X --
     x_field = None
     for pref in x_priority:
         col = has_col(pref)
@@ -776,12 +908,20 @@ async def chart_spec_tool(data_json: str, user_intent: str, *_, **kwargs) -> Dic
             x_field = col
             break
     if not x_field:
-        x_field = text_cols[0] if text_cols else cols_original[0]
+        x_field = text_cols[0] if text_cols else cols[0]
 
-    # Type de mark
+    # -- 7) Type de mark --
     mark_type = "line" if any(k in intent for k in ["évolution", "evolution", "tendance", "over time"]) else "bar"
 
-    # Spec Vega-Lite
+    # -- 8) Détection automatique de type temporal pour les dates --
+    def _looks_like_date(v: str) -> bool:
+        return bool(re.match(r"\d{4}-\d{2}-\d{2}$", v)) or bool(re.match(r"\d{2}/\d{2}/\d{4}$", v))
+
+    x_type = "nominal"
+    if text_cols and isinstance(sample.get(x_field), str) and _looks_like_date(sample.get(x_field, "")):
+        x_type = "temporal"
+
+    # -- 9) Spec Vega-Lite --
     spec = {
         "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
         "data": {"values": data},
@@ -790,18 +930,17 @@ async def chart_spec_tool(data_json: str, user_intent: str, *_, **kwargs) -> Dic
         ],
         "mark": {"type": mark_type, "tooltip": True},
         "encoding": {
-            "x": {"field": f"{x_field}_label", "type": "nominal", "axis": {"labelAngle": -45}},
+            "x": {"field": f"{x_field}_label", "type": x_type, "axis": {"labelAngle": -45}},
             "y": {"field": y_field, "type": "quantitative"},
         },
         "config": {"axis": {"labelFontSize": 12, "titleFontSize": 12}},
     }
-
     if mark_type == "bar":
         spec["encoding"]["x"]["sort"] = f"-{y_field}"
         spec["width"] = 900
         spec["height"] = 450
 
-    # Render to PNG (fallback to SVG)
+    # -- 10) Rendu image --
     png_bytes = None
     svg_text = None
     try:
@@ -820,7 +959,7 @@ async def chart_spec_tool(data_json: str, user_intent: str, *_, **kwargs) -> Dic
         except Exception:
             pass
 
-    # Save artifacts via ToolContext (Part); retrieve injected context
+    # -- 11) Sauvegarde en Artifacts (bytes) --
     context = kwargs.get("context") or kwargs.get("tool_context") or kwargs.get("_context")
     if context is not None:
         if png_bytes:
@@ -837,7 +976,6 @@ async def chart_spec_tool(data_json: str, user_intent: str, *_, **kwargs) -> Dic
         await context.save_artifact(filename="graphique.spec.vega-lite.json", artifact=spec_part)
 
     return {"text": "Voici le graphique."}
-
 
 
 # --- Correctif pour l'Automatic Function Calling (AFC) ---
@@ -877,22 +1015,11 @@ def render_vega_block(viz_out: Dict[str, Any]) -> Dict[str, str]:
 _materialize_annotations(get_full_schema_context) 
 _materialize_annotations(rag_sql_examples)
 _materialize_annotations(get_full_context_for_sql)
-_materialize_annotations(pick_example_sql)
-_materialize_annotations(run_sql_with_examples_first)
 _materialize_annotations(run_sql)
 _materialize_annotations(chart_spec_tool)
 _materialize_annotations(render_vega_block)
 
 # --- Définitions des Agents ---
-
-def _wants_chart(text: str) -> bool:
-    if not text: return False
-    t = text.lower()
-    triggers = [
-        "graph", "graphique", "courbe", "bar chart", "barre", "camembert",
-        "line chart", "visualisation", "viz", "plot", "évolution", "tendance"
-    ]
-    return any(k in t for k in triggers)
 
 ux_agent = LlmAgent(
     name="ux_agent",
@@ -921,7 +1048,7 @@ metadata_agent = LlmAgent(
 sql_agent = LlmAgent(
     name="sql_agent",
     model=MODEL,
-    description="Génère et exécute une requête SQL en utilisant un contexte fourni.",
+    description="Génère et exécute une requête SQL en utilisant un contexte fourni et optionnellement un exemple de référence.",
     instruction=(
         """Tu es un worker SQL technique.
         - Ne t’adresse JAMAIS à l’utilisateur.
@@ -930,15 +1057,16 @@ sql_agent = LlmAgent(
         ENTRÉES FOURNIES
         - `question` (texte en langage naturel)
         - `get_full_context_for_sql_response` contenant :
-        - `schema_details` (tables, colonnes, relations, business_concepts)
-        - `examples` (requêtes SQL précédemment validées)
+          - `schema_details` (tables, colonnes, relations, business_concepts)
+          - `examples` (requêtes SQL précédemment validées)
+          - OPTIONNEL : `priority_example` avec `sql_retargeted` (exemple prioritaire déjà retargeté)
 
         PROCESSUS OBLIGATOIRE
         1) Analyse la `question` et le contexte.
         2) Génère UNE requête SQL BigQuery en appliquant la HIERARCHIE DES RÈGLES.
         3) Exécute la requête via l’outil `run_sql`.
-        4) Appelle `transfer_to_agent` vers `root_agent_reine_des_maracas` avec un UNIQUE message JSON STRICT au format :
-        { "agent":"sql_agent", "question": <question>, "sql": <ta_requête>, "run_sql_response": <sortie_de_run_sql> }
+        4) Appelle `transfer_to_agent` vers `root_agent_reine_des_maracas` avec la syntaxe correcte :
+        transfer_to_agent(agent_name='root_agent_reine_des_maracas', message='{"agent":"sql_agent", "question": <question>, "sql": <ta_requête>, "run_sql_response": <sortie_de_run_sql>, "used_priority_example": <true/false>}')
         5) Ne renvoie AUCUN autre texte, AUCUNE explication.
 
 
@@ -954,6 +1082,7 @@ sql_agent = LlmAgent(
         (Ne qualifie jamais les alias de CTE.)
         - N’emploie que les colonnes présentes dans `schema_details.tables[*].fields`.
         - Relations & clés : déduis les JOINs à partir de `schema_details.tables[*].joins`.
+        - Préférence de jointure transaction ↔ référentiel : `tc.EAN = ref.EAN` (sauf contexte contraire explicite dans le schéma ou la question).
         - Business concepts : si la question correspond à un concept, utilise l’expression SQL fournie dans
         `business_concepts.metrics` et `business_concepts.dimensions`.
 
@@ -979,10 +1108,19 @@ sql_agent = LlmAgent(
         7) Mesure principale :
         - Si tu calcules un chiffre d’affaires, alias `ca`, enveloppé par `COALESCE(..., 0)`
 
+        ALIGNEMENT STRICT SUR EXEMPLE (si `priority_example` présent)
+        - Démarre par copier-coller EXACTEMENT `priority_example.sql_retargeted` (CTE, alias, JOINs).
+        - N'ajoute PAS de nouvelles tables / CTE / colonnes, SAUF:
+          - filtres/conditions sur dates, texte, booléens demandé(e)s par la question ;
+          - projections supplémentaires (alias) hors agrégats critiques, si et seulement si nécessaire pour répondre.
+        - Conserve les gardes-fous (SAFE.PARSE_DATE, COALESCE, LEFT JOIN, qualification complète).
+
         CONTRAINTES DE SORTIE
         - Exécute la requête avec l’outil `run_sql`.
-        - Puis appelle `transfer_to_agent` vers `root_agent_reine_des_maracas` avec EXACTEMENT :
-        { "agent":"sql_agent", "question": <question>, "sql": <ta_requête>, "run_sql_response": <sortie_de_run_sql> }
+        - Puis appelle `transfer_to_agent` avec EXACTEMENT cette syntaxe :
+          transfer_to_agent(agent_name='root_agent_reine_des_maracas', message='{"agent":"sql_agent", "question": "<question>", "sql": "<ta_requête>", "run_sql_response": <sortie_de_run_sql>, "used_priority_example": <true/false>}')
+        - Le paramètre `message` doit être une CHAÎNE JSON valide (entre guillemets simples).
+        - ATTENTION : N'utilise JAMAIS de noms de variables inventés ou de syntaxe Python incorrecte.
         - Ne produis AUCUN autre contenu.
         """
     ),
@@ -997,7 +1135,7 @@ viz_agent = LlmAgent(
     instruction=(
         "Ne t'adresse JAMAIS à l'utilisateur.\n"
         "Tu reçois { data_json, user_intent }.\n"
-        "1) Appelle l'outil `chart_spec(data_json=<data_json>, user_intent=<user_intent>)`.\n"
+        "1) Appelle l'outil `chart_spec_tool(data_json=<data_json>, user_intent=<user_intent>)`.\n"
         "2) Le tool sauvegarde l'image en artifact et renvoie un court texte. Renvoie ce texte tel quel."
     ),
     tools=[chart_spec_tool],
@@ -1008,28 +1146,26 @@ root_agent = LlmAgent(
     model=MODEL,
     description="Orchestre les agents spécialisés pour répondre aux questions analytiques.",
     
-    # --- AJOUT DU PLANNER ---
     planner=BuiltInPlanner(
         thinking_config=genai_types.ThinkingConfig(
             # On active la réflexion interne du modèle pour suivre le plan
             include_thoughts=False, 
         )
-    ),
-    # --- FIN DE L'AJOUT ---
-    
+    ),    
 instruction=(
         "Tu es l'orchestrateur principal et le SEUL à communiquer avec l'utilisateur.\n"
         "Ton travail consiste à suivre un plan séquentiel en appelant des agents spécialisés. Tu ne dois JAMAIS afficher leurs réponses brutes, qui sont tes notes de travail internes.\n\n"
         "**PLAN D'ACTION SÉQUENTIEL OBLIGATOIRE :**\n"
-        "1.  **ÉTAPE 1 : Collecte du Schéma et des Exemples SQL.**\n"
-        "    - Appelle `metadata_agent` avec la question initiale pour obtenir le contexte complet.\n"
+        "1.  **ÉTAPE 1 : Collecte du Contexte Complet.**\n"
+        "    - Appelle `metadata_agent` avec la question initiale pour obtenir le contexte complet (schéma + exemples + exemple prioritaire si pertinent).\n"
         "2.  **ÉTAPE 2 : Génération SQL.**\n"
-        "    - Appelle `sql_agent` en lui passant la question initiale et ce `contexte` combinés.\n"
-        "4.  **ÉTAPE 4 : Synthèse de la Réponse Finale.**\n"
-        "    - Le résultat de l'étape 3 est un objet JSON. Extrais la valeur de la clé `sql_result` pour l'analyse.\n"
+        "    - Appelle `sql_agent` en lui passant la question initiale et le contexte de l'étape 1.\n"
+        "    - Le contexte peut contenir un `priority_example` avec SQL retargeté que le sql_agent DOIT utiliser comme base s'il est présent.\n"
+        "3.  **ÉTAPE 3 : Synthèse de la Réponse Finale.**\n"
+        "    - Le résultat de l'étape 2 est un objet JSON. Extrais la valeur de la clé `run_sql_response` pour l'analyse.\n"
         "    - Si le résultat contient une erreur, explique-la simplement à l'utilisateur.\n"
-        "    - Si l'utilisateur a demandé un graphique et que les données sont valides, appelle `viz_agent` avec les données de `sql_result`.\n"
-        "    - Sinon, formule une réponse finale claire en langage naturel pour l'utilisateur en te basant sur les données de `sql_result`.\n\n"
+        "    - Si l'utilisateur a demandé un graphique et que les données sont valides, appelle `viz_agent` avec les données de `run_sql_response`.\n"
+        "    - Sinon, formule une réponse finale claire en langage naturel pour l'utilisateur en te basant sur les données de `run_sql_response`.\n\n"
         "**Cas particulier :** Si la question initiale est ambiguë, appelle `ux_agent` avant de commencer le plan."
     ),
     tools=[render_vega_block],
