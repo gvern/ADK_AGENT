@@ -7,4 +7,7 @@ __pycache__/
 .chroma/
 
 historique_deploiement.md
-doc_tempo.md
+doc_tempo.py
+agents_cibles.md
+deploy_us.py
+deploy.py
