@@ -21,7 +21,6 @@ import numpy as np
 from google.cloud import bigquery
 from google.api_core.exceptions import GoogleAPICallError, BadRequest, Forbidden
 from google.adk.agents.llm_agent import LlmAgent
-from google.adk.planners import BuiltInPlanner
 import google.genai.types as genai_types
 
 # --- Vérification et importation des dépendances ---
@@ -812,35 +811,34 @@ def run_sql(query: str) -> Dict[str, Any]:
         logger.error(f"Échec du job SQL : {e} sur la requête : {final_query}")
         return {"error": f"Erreur lors de l'exécution de la requête : {str(e)}"}
     
-async def chart_spec_tool(data_json: str, user_intent: str, *_, **kwargs) -> Dict[str, Any]:
+async def chart_spec_tool(data_json: str, user_intent: str) -> Dict[str, Any]:
     """
-    Génère une spec Vega-Lite à partir de données (list[dict]) et enregistre :
-      - l'image (PNG si possible, sinon SVG)
-      - la spec JSON
-    comme Artifacts ADK (bytes).
-    Retourne {"text": "..."} pour le root.
+    Génère UNIQUEMENT une spec Vega-Lite à partir de données JSON.
+    Ne génère pas d'image et ne sauvegarde pas d'artefact.
     """
     import json
     import unicodedata
 
-    # -- 1) Parse & garde-fous --
+    logger.info("[viz] chart_spec_tool (spec only) called.")
+
+    # -- Parse & garde-fous --
     try:
-      data = json.loads(data_json)
-      if not isinstance(data, list) or not data:
-          return {"text": "Données vides ou invalides pour le graphique."}
+        data = json.loads(data_json)
+        if not isinstance(data, list) or not data:
+            return {"error": "Données vides pour le graphique."}
     except json.JSONDecodeError:
-      return {"text": "JSON invalide."}
+        return {"error": "JSON invalide."}
 
     sample = data[0]
     cols = list(sample.keys())
     intent = (user_intent or "").lower()
 
-    # -- 2) Normalisation colonnes pour matching tolérant --
+    # -- Normalisation colonnes --
     def _norm(s: str) -> str:
-        s2 = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
-        return s2.lower().strip()
+        return unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii").lower().strip()
 
-    col_norm_map = {_norm(c): c for c in cols}  # "ville" -> "VILLE" (original)
+    col_norm_map = {_norm(c): c for c in cols}
+
     def has_col(*candidates: str) -> Optional[str]:
         for cand in candidates:
             real = col_norm_map.get(_norm(cand))
@@ -848,15 +846,13 @@ async def chart_spec_tool(data_json: str, user_intent: str, *_, **kwargs) -> Dic
                 return real
         return None
 
-    # -- 3) Heuristiques ID & types --
     def looks_like_id(name: str) -> bool:
         n = _norm(name)
         return n.startswith(("id_", "code_", "num_")) or n in {"id", "code", "num", "numero", "code_boutique"}
 
     numeric_cols = [c for c in cols if isinstance(sample.get(c), (int, float))]
-    text_cols    = [c for c in cols if isinstance(sample.get(c), str)]
+    text_cols = [c for c in cols if isinstance(sample.get(c), str)]
 
-    # -- 4) Alias & priorités (robustes à la casse/accents) --
     x_priority = [
         "libelle_modele", "libellé_modèle", "ville", "ville_magasin",
         "famille", "ligne", "id_modele", "id_modèle", "magasin", "boutique",
@@ -868,21 +864,12 @@ async def chart_spec_tool(data_json: str, user_intent: str, *_, **kwargs) -> Dic
         ("panier_moyen", "basket", "avg_basket"),
     ]
     if any(k in intent for k in ["chiffre", "ca", "revenue", "vente", "ventes"]):
-        y_alias_groups = [
-            ("ca", "chiffre_affaires", "chiffre", "revenue", "sales"),
-            ("quantite_vendue", "quantité", "quantite", "qty", "qte"),
-            ("panier_moyen", "basket", "avg_basket"),
-        ]
+        y_alias_groups = [y_alias_groups[0], y_alias_groups[1], y_alias_groups[2]]
     elif any(k in intent for k in ["quantité", "quantite", "qty", "qte"]):
-        y_alias_groups = [
-            ("quantite_vendue", "quantité", "quantite", "qty", "qte"),
-            ("ca", "chiffre_affaires", "chiffre", "revenue", "sales"),
-            ("panier_moyen", "basket", "avg_basket"),
-        ]
+        y_alias_groups = [y_alias_groups[1], y_alias_groups[0], y_alias_groups[2]]
 
     metric_candidates = [c for c in numeric_cols if not looks_like_id(c)]
 
-    # -- 5) Choix Y --
     y_field = None
     for group in y_alias_groups:
         col = has_col(*group)
@@ -898,9 +885,8 @@ async def chart_spec_tool(data_json: str, user_intent: str, *_, **kwargs) -> Dic
         elif numeric_cols:
             y_field = numeric_cols[0]
         else:
-            return {"text": "Aucune métrique numérique détectée pour un graphique."}
+            return {"error": "Aucune métrique numérique détectée pour un graphique."}
 
-    # -- 6) Choix X --
     x_field = None
     for pref in x_priority:
         col = has_col(pref)
@@ -910,23 +896,20 @@ async def chart_spec_tool(data_json: str, user_intent: str, *_, **kwargs) -> Dic
     if not x_field:
         x_field = text_cols[0] if text_cols else cols[0]
 
-    # -- 7) Type de mark --
     mark_type = "line" if any(k in intent for k in ["évolution", "evolution", "tendance", "over time"]) else "bar"
 
-    # -- 8) Détection automatique de type temporal pour les dates --
     def _looks_like_date(v: str) -> bool:
         return bool(re.match(r"\d{4}-\d{2}-\d{2}$", v)) or bool(re.match(r"\d{2}/\d{2}/\d{4}$", v))
 
-    x_type = "nominal"
-    if text_cols and isinstance(sample.get(x_field), str) and _looks_like_date(sample.get(x_field, "")):
-        x_type = "temporal"
+    x_type = "temporal" if (text_cols and isinstance(sample.get(x_field), str) and _looks_like_date(sample.get(x_field, ""))) else "nominal"
 
-    # -- 9) Spec Vega-Lite --
+    calculate_expression = f"isValid(datum[\"{x_field}\"]) ? datum[\"{x_field}\"] : \"Non renseigné\""
+
     spec = {
         "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
         "data": {"values": data},
         "transform": [
-            {"calculate": f"isValid(datum['{x_field}']) ? datum['{x_field}'] : 'Non renseigné'", "as": f"{x_field}_label"}
+            {"calculate": calculate_expression, "as": f"{x_field}_label"}
         ],
         "mark": {"type": mark_type, "tooltip": True},
         "encoding": {
@@ -940,43 +923,90 @@ async def chart_spec_tool(data_json: str, user_intent: str, *_, **kwargs) -> Dic
         spec["width"] = 900
         spec["height"] = 450
 
-    # -- 10) Rendu image --
-    png_bytes = None
-    svg_text = None
+    # La fonction retourne maintenant UNIQUEMENT la spec.
+    return {"vega_lite_spec": spec}
+
+
+
+async def persist_viz_artifacts(spec_json: str) -> Dict[str, str]:
+    """
+    Prend une spec Vega-Lite, génère une image PNG, et sauvegarde la spec et l'image comme artefacts.
+    """
+    # Import paresseux pour éviter les imports circulaires avec services.py
     try:
-        from vl_convert import vl_convert as vlc
+        from importlib import import_module
+        _services = import_module('reine_des_maracas.services')
+        runner = getattr(_services, 'runner', None)
+        APP_NAME = getattr(_services, 'APP_NAME', os.getenv("ADK_APP_NAME", "reine_des_maracas"))
+        session_service_stateful = getattr(_services, 'session_service_stateful', None)
+    except Exception as e:
+        logger.error(f"Impossible d'importer les services (lazy): {e}")
+        return {"text": f"Services indisponibles: {e}"}
+
+    # On vérifie si le runner et son service d'artefacts sont bien disponibles
+    if runner is None or getattr(runner, 'artifact_service', None) is None:
+        msg = "Le runner global ou son service d'artefacts ne sont pas initialisés."
+        logger.error(msg)
+        return {"text": msg}
+
+    try:
+        import json
+        # Étape 1 : Générer l'image PNG à partir de la spec
         try:
+            from vl_convert import vl_convert as vlc
+            spec = json.loads(spec_json)
             png_bytes = vlc.vegalite_to_png(spec)
-        except Exception:
-            svg_text = vlc.vegalite_to_svg(spec)
-    except Exception:
-        try:
-            from vl_convert import VegaLite
-            try:
-                png_bytes = VegaLite(spec).png()
-            except Exception:
-                svg_text = VegaLite(spec).svg()
-        except Exception:
-            pass
+            logger.info("[root] Image PNG générée avec succès à partir de la spec.")
+        except Exception as e:
+            logger.error(f"[root] Échec de la génération de l'image PNG : {e}")
+            return {"text": f"Erreur lors de la génération de l'image : {e}"}
 
-    # -- 11) Sauvegarde en Artifacts (bytes) --
-    context = kwargs.get("context") or kwargs.get("tool_context") or kwargs.get("_context")
-    if context is not None:
-        if png_bytes:
-            img_part = genai_types.Part.from_bytes(data=png_bytes, mime_type="image/png")
-            await context.save_artifact(filename="graphique.png", artifact=img_part)
-        elif svg_text:
-            svg_part = genai_types.Part.from_bytes(data=svg_text.encode("utf-8"), mime_type="image/svg+xml")
-            await context.save_artifact(filename="graphique.svg", artifact=svg_part)
+        # On récupère le service directement depuis notre instance de runner
+        artifact_service = runner.artifact_service
+        
+        # On a besoin des IDs de la session actuelle pour sauvegarder au bon endroit.
+        # On les récupère depuis le service de session.
+        # Note : ceci suppose une seule session active dans l'environnement de test local.
+        # C'est le comportement par défaut de adk web.
+        # Étape 2 : Sauvegarder les artefacts (CORRIGÉ)
+        artifact_service = runner.artifact_service
+        
+        # list_sessions renvoie un objet, pas une liste.
+        list_sessions_response = await session_service_stateful.list_sessions(app_name=APP_NAME, user_id="user")
+        
+        # On accède à l'attribut .sessions pour obtenir la VRAIE liste des IDs.
+        if not list_sessions_response or not list_sessions_response.sessions:
+            raise RuntimeError("Aucune session active trouvée pour sauvegarder l'artefact.")
+        
+        # On prend le premier ID de la liste .sessions
+        session_id = list_sessions_response.sessions[0]
 
+        # Création de la Part pour la spec JSON
         spec_part = genai_types.Part.from_bytes(
-            data=json.dumps(spec, ensure_ascii=False, indent=2).encode("utf-8"),
-            mime_type="application/json"
+            data=spec_json.encode("utf-8"),
+            mime_type="application/json",
         )
-        await context.save_artifact(filename="graphique.spec.vega-lite.json", artifact=spec_part)
+        await artifact_service.save_artifact(
+            app_name=APP_NAME, user_id="adk-user", session_id=session_id,
+            filename="graphique.spec.vega-lite.json", artifact=spec_part
+        )
+        # Création et sauvegarde de la Part pour l'image PNG
+        if png_bytes:
+            img_part = genai_types.Part.from_bytes(
+                data=png_bytes,
+                mime_type="image/png",
+            )
+            await artifact_service.save_artifact(
+                app_name=APP_NAME, user_id="adk-user", session_id=session_id,
+                filename="graphique.png", artifact=img_part
+            )
+        
+        logger.info("Artefacts sauvegardés avec succès via le service direct du runner.")
+        return {"text": "Artifacts sauvegardés."}
 
-    return {"text": "Voici le graphique."}
-
+    except Exception as e:
+        logger.error(f"Échec de sauvegarde des artifacts via le service direct : {e}")
+        return {"text": f"Échec de sauvegarde des artifacts: {e}"}
 
 # --- Correctif pour l'Automatic Function Calling (AFC) ---
 # Matérialise les annotations de chaînes en types réels pour éviter les erreurs AFC
@@ -990,25 +1020,30 @@ def _materialize_annotations(func):
     return func
 
 # --- Outil de rendu Vega-Lite ---
-def render_vega_block(viz_out: Dict[str, Any]) -> Dict[str, str]:
-    """Construit un bloc de code vega-lite à partir d'une sortie de viz_agent ou d'une spec directe.
-    Accepte soit un objet contenant la clé 'vega_lite_spec', soit directement la spec (dict/str).
-    Retourne {"text": "```vega-lite\n...\n```"}
+def render_vega_block(viz_out: Any) -> Dict[str, str]:
+    """Construit un bloc de code Vega-Lite à partir d'une spec directe ou d'une sortie d'agent.
+
+    Accepte:
+    - un dict contenant la clé "vega_lite_spec"
+    - une spec Vega-Lite directement (dict ou str JSON)
     """
     try:
         spec = viz_out.get("vega_lite_spec") if isinstance(viz_out, dict) else viz_out
+        # Si None (dict sans la clé), considère le dict entier comme étant la spec
+        if spec is None and isinstance(viz_out, dict):
+            spec = viz_out
     except Exception:
         spec = viz_out
 
-    # Tolérer l'ancienne version qui renvoyait une chaîne JSON
     if isinstance(spec, str):
         try:
             spec = json.loads(spec)
         except Exception:
-            # Si ce n'est pas du JSON valide, on l'enveloppe dans un objet minimal
             spec = {"_raw": spec}
 
-    text = "```vega-lite\n" + json.dumps(spec, ensure_ascii=False, indent=2) + "\n```"
+    spec_json = json.dumps(spec, ensure_ascii=False, indent=2)
+    text = f"```vega-lite\n{spec_json}\n```"
+
     return {"text": text}
 
 # Matérialiser les annotations des fonctions exposées comme tools
@@ -1016,8 +1051,9 @@ _materialize_annotations(get_full_schema_context)
 _materialize_annotations(rag_sql_examples)
 _materialize_annotations(get_full_context_for_sql)
 _materialize_annotations(run_sql)
-_materialize_annotations(chart_spec_tool)
 _materialize_annotations(render_vega_block)
+_materialize_annotations(chart_spec_tool)
+_materialize_annotations(persist_viz_artifacts)
 
 # --- Définitions des Agents ---
 
@@ -1128,48 +1164,33 @@ sql_agent = LlmAgent(
 )
 
 
-viz_agent = LlmAgent(
-    name="viz_agent",
-    model=MODEL,
-    description="Génère une spec Vega-Lite à partir de données JSON.",
-    instruction=(
-        "Ne t'adresse JAMAIS à l'utilisateur.\n"
-        "Tu reçois { data_json, user_intent }.\n"
-        "1) Appelle l'outil `chart_spec_tool(data_json=<data_json>, user_intent=<user_intent>)`.\n"
-        "2) Le tool sauvegarde l'image en artifact et renvoie un court texte. Renvoie ce texte tel quel."
-    ),
-    tools=[chart_spec_tool],
-)
-
 root_agent = LlmAgent(
     name="root_agent_reine_des_maracas",
     model=MODEL,
     description="Orchestre les agents spécialisés pour répondre aux questions analytiques.",
-    
-    planner=BuiltInPlanner(
-        thinking_config=genai_types.ThinkingConfig(
-            # On active la réflexion interne du modèle pour suivre le plan
-            include_thoughts=False, 
-        )
-    ),    
-instruction=(
+    instruction=(
         "Tu es l'orchestrateur principal et le SEUL à communiquer avec l'utilisateur.\n"
-        "Ton travail consiste à suivre un plan séquentiel en appelant des agents spécialisés. Tu ne dois JAMAIS afficher leurs réponses brutes, qui sont tes notes de travail internes.\n\n"
+        "Ton travail consiste à suivre un plan séquentiel en appelant des agents spécialisés ou tes propres outils. Tu ne dois JAMAIS afficher leurs réponses brutes.\n\n"
         "**PLAN D'ACTION SÉQUENTIEL OBLIGATOIRE :**\n"
         "1.  **ÉTAPE 1 : Collecte du Contexte Complet.**\n"
-        "    - Appelle `metadata_agent` avec la question initiale pour obtenir le contexte complet (schéma + exemples + exemple prioritaire si pertinent).\n"
+        "    - Appelle le sous-agent `metadata_agent` avec la question initiale pour obtenir le contexte complet.\n"
         "2.  **ÉTAPE 2 : Génération SQL.**\n"
-        "    - Appelle `sql_agent` en lui passant la question initiale et le contexte de l'étape 1.\n"
-        "    - Le contexte peut contenir un `priority_example` avec SQL retargeté que le sql_agent DOIT utiliser comme base s'il est présent.\n"
-        "3.  **ÉTAPE 3 : Synthèse de la Réponse Finale.**\n"
-        "    - Le résultat de l'étape 2 est un objet JSON. Extrais la valeur de la clé `run_sql_response` pour l'analyse.\n"
-        "    - Si le résultat contient une erreur, explique-la simplement à l'utilisateur.\n"
-        "    - Si l'utilisateur a demandé un graphique et que les données sont valides, appelle `viz_agent` avec les données de `run_sql_response`.\n"
-        "    - Sinon, formule une réponse finale claire en langage naturel pour l'utilisateur en te basant sur les données de `run_sql_response`.\n\n"
-        "**Cas particulier :** Si la question initiale est ambiguë, appelle `ux_agent` avant de commencer le plan."
+        "    - Appelle le sous-agent `sql_agent` en lui passant la question initiale et le contexte de l'étape 1.\n"
+        "3.  **ÉTAPE 3 : Traitement du Résultat et Visualisation.**\n"
+        "    - Extrais la valeur de `run_sql_response` de la sortie de l'agent précédent.\n"
+        "    - Si c'est une erreur, explique-la à l'utilisateur et arrête-toi là.\n"
+        "    - Si une visualisation est demandée et que les données sont valides, **exécute directement le plan de visualisation suivant :**\n"
+        "    - **3a. GÉNÉRATION DE LA SPEC : Appelle ton propre outil `chart_spec_tool` avec les données JSON de la requête SQL et l'intention de l'utilisateur pour obtenir la `vega_lite_spec`.**\n"
+        "    - **3b. SAUVEGARDE DE L'ARTEFACT : Prends la `vega_lite_spec` obtenue à l'étape précédente, transforme-la en chaîne JSON, et appelle ton outil `persist_viz_artifacts` avec cette chaîne.**\n"
+        "    - **3c. PRÉPARATION DE L'AFFICHAGE : Appelle ton outil `render_vega_block` avec la `vega_lite_spec` pour préparer le bloc de code à afficher dans le chat.**\n"
+        "    - **3d. RÉPONSE FINALE : Combine le résultat de `render_vega_block` (le graphe) avec une explication textuelle des résultats pour formuler ta réponse finale à l'utilisateur.**\n"
+        "    - Si aucune visualisation n'était demandée, formule une réponse textuelle à partir des données.\n\n"
+        "**Cas particulier :** Si la question initiale est ambiguë, appelle le sous-agent `ux_agent` avant de commencer le plan."
     ),
-    tools=[render_vega_block],
-    sub_agents=[ux_agent, metadata_agent, sql_agent, viz_agent],
+    # Le root_agent a désormais tous les outils de visualisation nécessaires
+    tools=[chart_spec_tool, render_vega_block, persist_viz_artifacts],
+    # viz_agent supprimé de la liste des sous-agents
+    sub_agents=[ux_agent, metadata_agent, sql_agent],
 )
 
 # --- Initialisation au démarrage ---
